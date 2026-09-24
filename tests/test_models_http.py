@@ -10,17 +10,22 @@ stop_all() при зупинці (§9); підроблені процеси са
 from __future__ import annotations
 
 import json
+import threading
+import time
 from typing import Any, Callable
 
+import anyio
 import pytest
 
-from .conftest import STRANGER, has_cyrillic, ok_json, refusal
+from .conftest import BASE_URL, STRANGER, has_cyrillic, ok_json, refusal
 from .model_fakes import (
     CARD_MIB,
     GATED_REPO,
     HUGE_RESERVE_GIB,
     MIB,
     MISSING_REPO,
+    NO_WEIGHTS_FILES,
+    NO_WEIGHTS_REPO,
     REPO,
     REPO_B,
     gib_close,
@@ -246,6 +251,11 @@ def _search_hub_down(env: Any, c: Any) -> Any:
     return c.get(SEARCH, params={"q": "llama"})
 
 
+def _download_no_weights(env: Any, c: Any) -> Any:
+    env.hub.add(NO_WEIGHTS_REPO, NO_WEIGHTS_FILES)
+    return _download(c, NO_WEIGHTS_REPO)
+
+
 # code → (перевизначення конфігу, дія над (env, client), що має відмовити цим кодом).
 HTTP_REFUSALS: dict[str, tuple[dict[str, Any], Callable[[Any, Any], Any]]] = {
     "unknown_user": ({}, lambda env, c: _download(c, REPO, STRANGER)),
@@ -257,6 +267,7 @@ HTTP_REFUSALS: dict[str, tuple[dict[str, Any], Callable[[Any, Any], Any]]] = {
     "download_active": ({}, _delete_active),
     "download_not_active": ({}, lambda env, c: c.post(CANCEL, json={"repo": REPO, "user": "alice"})),
     "model_not_local": ({}, lambda env, c: c.post(DELETE, json={"repo": REPO, "user": "alice"})),
+    "no_vllm_weights": ({}, _download_no_weights),
 }
 
 
@@ -308,6 +319,119 @@ def test_http_gated_download_starts_nothing(models_env):
     with env.client() as c:
         refusal(_download(c, GATED_REPO), "hf_gated")
     assert env.spawn.processes == [], f"after hf_gated over HTTP: expected no process, got {env.spawn.repos!r}"
+
+
+# --- Маршрути не блокують сервер (§6) --------------------------------------------------------------------------------------------------
+
+# Найдовше, скільки підроблений hub тримає запит, с. Це межа зависання тесту, а не поріг специфікації:
+# сервер, що блокується, відповість на /api/overview лише після неї, і тест це покаже.
+HOLD_S = 5.0
+
+
+class _HeldHubCall:
+    """Підміняє метод підробленого hub: виклик ставить entered і чекає release (не довше HOLD_S).
+
+    Синхронізація — подіями, без sleep: тест відпускає hub лише після відповіді /api/overview.
+    returned — метод hub уже повернувся (відпустив тест або минув HOLD_S).
+    """
+
+    def __init__(self, hub: Any, method: str) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.returned = threading.Event()
+        original = getattr(hub, method)
+
+        def held(*args: Any, **kwargs: Any) -> Any:
+            self.entered.set()
+            self.release.wait(HOLD_S)
+            self.returned.set()
+            return original(*args, **kwargs)
+
+        setattr(hub, method, held)
+
+
+async def _lifespan(app: Any, started: Any, stop: Any) -> None:
+    """Протокол lifespan ASGI, як у TestClient у режимі `with`: startup, чекання stop, shutdown."""
+    sent: list[str] = []
+
+    async def receive() -> dict[str, Any]:
+        if not sent:
+            sent.append("startup")
+            return {"type": "lifespan.startup"}
+        await stop.wait()
+        return {"type": "lifespan.shutdown"}
+
+    async def send(message: dict[str, Any]) -> None:
+        if message.get("type") in ("lifespan.startup.complete", "lifespan.startup.failed"):
+            started.set()
+
+    await app({"type": "lifespan", "asgi": {"version": "3.0", "spec_version": "2.0"}, "state": {}}, receive, send)
+
+
+def _overview_while_held(env: Any, method: str, request: Callable[[Any], Any]) -> dict[str, Any]:
+    """В одному циклі подій: request чекає на hub.method, тим часом — GET /api/overview.
+
+    Повертає entered (маршрут дійшов до hub), overview (відповідь), overview_s (скільки вона тривала, с) і
+    held (hub ще тримав запит, коли /api/overview відповів).
+    """
+    import httpx
+
+    from gpu_manager.app import build_app
+
+    app = build_app(env.cfg, env.manager, models=env.store)
+    hold = _HeldHubCall(env.hub, method)
+    out: dict[str, Any] = {}
+
+    async def scenario() -> None:
+        started, stop, route_done = anyio.Event(), anyio.Event(), anyio.Event()
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_lifespan, app, started, stop)
+            with anyio.fail_after(HOLD_S):
+                await started.wait()
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=BASE_URL) as client:
+
+                async def slow_route() -> None:
+                    try:
+                        out["route"] = await request(client)
+                    finally:
+                        route_done.set()
+
+                tg.start_soon(slow_route)
+                out["entered"] = await anyio.to_thread.run_sync(hold.entered.wait, HOLD_S)
+                t0 = time.monotonic()
+                out["overview"] = await client.get("/api/overview")
+                out["overview_s"] = time.monotonic() - t0
+                out["held"] = not hold.returned.is_set()
+                hold.release.set()
+                with anyio.fail_after(2 * HOLD_S):
+                    await route_done.wait()
+            stop.set()
+
+    anyio.run(scenario)
+    return out
+
+
+# Маршрути §6.1, §6.2, §6.4, що чекають на HF: (метод hub, який тримається; запит).
+HF_BOUND_ROUTES: dict[str, tuple[str, Callable[[Any], Any]]] = {
+    "search": ("search", lambda c: c.get(SEARCH, params={"q": "llama", "limit": 3})),
+    "info": ("files", lambda c: c.get(INFO, params={"repo": REPO})),
+    "download": ("files", lambda c: c.post(DOWNLOAD, json={"repo": REPO, "user": "alice"})),
+}
+
+
+@pytest.mark.req("SPEC-GPU-002 §6")
+@pytest.mark.parametrize("route", sorted(HF_BOUND_ROUTES))
+def test_http_models_route_waiting_on_hf_does_not_block_overview(models_env, route):
+    """§6: поки маршрут моделей чекає на HF, GET /api/overview відповідає — ще до того, як hub відпущено."""
+    method, request = HF_BOUND_ROUTES[route]
+    out = _overview_while_held(models_env, method, request)
+    status = getattr(out.get("overview"), "status_code", None)
+    ok = out.get("entered") is True and status == 200 and out.get("held") is True
+    assert ok, (
+        f"{route}: expected GET /api/overview -> HTTP 200 while hub.{method} is still held (up to {HOLD_S} s); "
+        f"got route reached hub={out.get('entered')!r}, overview HTTP {status}, answered in {out.get('overview_s', float('nan')):.2f} s, "
+        f"hub still held at that moment={out.get('held')!r}"
+    )
 
 
 # --- Захист (SPEC-GPU-001 §7.1) --------------------------------------------------------------------------------------------------------------

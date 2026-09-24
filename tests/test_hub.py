@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from .conftest import has_cyrillic
-from .model_fakes import GIB, card_view, fit_card_oracle, fit_value, per_card_keys
+from .model_fakes import GIB, NO_WEIGHTS_FILES, card_view, fit_card_oracle, fit_value, per_card_keys
 
 pytestmark = pytest.mark.unit
 
@@ -20,6 +20,7 @@ EXCLUDED_EXTENSIONS = [".gguf", ".pth", ".pt", ".onnx", ".onnx_data", ".h5", ".m
 EXCLUDED_DIRS = ["original", "onnx", "openvino", "coreml", "gguf"]
 FP4_WARNING = "no hardware support below sm_100"  # текст попередження §3 для quant_method з fp4
 FP8_WARNING = "weight-only W8A16"  # текст попередження §3 для quant_method == fp8
+NO_WEIGHTS_WARNING = "no safetensors/bin weights"  # текст попередження §3 для weight_bytes = 0
 
 # «Кругла» модель для ручного рахунку §3.4: ваги рівно 2 GiB, kv = 2·4·2·128·2 = 4096 байт = 4.0 KiB.
 CLEAN_FILES = {"model.safetensors": 2 * GIB, "config.json": 512}
@@ -565,3 +566,32 @@ def test_estimate_fit_fp4_warning_keeps_usable_arithmetic():
     got = card_view(_fit(config=_quantized("nvfp4")), 10240)
     expected = {"usable_gib": 2.0, "fits": True, "max_context_tokens": 524288}
     assert got == expected, f"per_card[10240] with nvfp4: expected {expected!r}, got {got!r}"
+
+
+# --- §3 estimate_fit: немає ваг ---------------------------------------------------------------------------------------------------
+
+# Карти, на яких за формулою §3.4 без ваг usable > 0: 10240·0.5 − 1 = 4 GiB і 81920·0.5 − 1 = 39 GiB.
+ROOMY_CARDS = (10240, 81920)
+
+
+@pytest.mark.req("SPEC-GPU-002 §3.4")
+def test_estimate_fit_no_weights_fits_no_card():
+    """§3: weight_bytes = 0 (лише README і .gitattributes, як у репозиторію з GGUF) → fits false для кожної карти."""
+    fit = _fit(NO_WEIGHTS_FILES, cards=ROOMY_CARDS)
+    got = {mib: card_view(fit, mib)["fits"] for mib in ROOMY_CARDS}
+    expected = {mib: False for mib in ROOMY_CARDS}
+    assert got == expected, f"fits without weight files on cards {ROOMY_CARDS} MiB: expected {expected!r}, got {got!r}"
+
+
+@pytest.mark.req("SPEC-GPU-002 §3.4")
+def test_estimate_fit_no_weights_warns():
+    """§3: weight_bytes = 0 → попередження «no safetensors/bin weights»."""
+    got = _warnings(_fit(NO_WEIGHTS_FILES, cards=ROOMY_CARDS))
+    assert any(NO_WEIGHTS_WARNING in str(w) for w in got), f"no weight files: expected a warning with {NO_WEIGHTS_WARNING!r}, got {got!r}"
+
+
+@pytest.mark.req("SPEC-GPU-002 §3.4")
+def test_estimate_fit_bin_weights_not_reported_missing():
+    """§3.2: *.bin — теж ваги; модель лише з pytorch_model.bin не дає попередження про відсутні ваги."""
+    got = _warnings(_fit({"pytorch_model.bin": 2 * GIB, "config.json": 512}))
+    assert not any(NO_WEIGHTS_WARNING in str(w) for w in got), f"bin-only weights: expected no {NO_WEIGHTS_WARNING!r} warning, got {got!r}"

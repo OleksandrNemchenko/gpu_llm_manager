@@ -1,6 +1,6 @@
 """Веб-оболонка: сторінка і її JSON API. Ті самі виклики GpuManager, що й у MCP.
 
-Тексти відмов і попереджень — українською, бо їх читає людина на сторінці (рішення 8.3)."""
+Тексти відмов і попереджень — українською, бо їх читає людина на сторінці."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ _HISTORY_POINTS_DEFAULT = 120
 
 
 class HostGuard:
-    """Автентифікації немає за рішенням (довірені користувачі в TailScale), тож два дешеві захисти від
+    """Автентифікації немає свідомо (довірені користувачі в TailScale), тож два дешеві захисти від
     сторонньої сторінки в браузері користувача:
     - перелік дозволених Host: DNS rebinding не дістанеться до API;
     - POST на /api/ і /v1/ лише JSON і лише зі своїм Origin: HTML-форма чи fetch no-cors з чужого сайту не спрацює
@@ -103,7 +103,7 @@ def web_routes(manager: GpuManager, public_host: str) -> list[Route]:
         d = await json_body(request)
         hours = d.get("hours")
         # gpu передається як є: перевіряє ядро (int() зробив би з true карту 1)
-        result = manager.reserve(d["gpu"], str(d["user"]), str(d.get("purpose", "")),
+        result = manager.reserve(d["gpu"], str(d["user"]), str(d.get("purpose") or ""),
                                  float(hours) if hours not in (None, "") else None)
         return {**result, "warnings": [text(w["code"], UK, **w["params"]) for w in result["warnings"]]}
 

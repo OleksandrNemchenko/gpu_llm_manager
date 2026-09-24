@@ -48,10 +48,10 @@ def single_instance(path: Path) -> TextIO:
 
 
 def bind(host: str, port: int) -> socket.socket:
-    family = socket.AF_INET6 if ":" in host else socket.AF_INET
-    sock = socket.socket(family, socket.SOCK_STREAM)
+    """Сокет IPv4 на host:port (IPv6-адреси відхиляє конфіг)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.setsockopt(socket.IPPROTO_IPV6 if family == socket.AF_INET6 else socket.IPPROTO_IP, _IP_FREEBIND, 1)
+    sock.setsockopt(socket.IPPROTO_IP, _IP_FREEBIND, 1)
     sock.bind((host, port))
     return sock
 
@@ -72,6 +72,7 @@ def main() -> None:
     server = uvicorn.Server(uvicorn.Config(app, log_level="info", lifespan="on", access_log=False,
                                            timeout_graceful_shutdown=_GRACEFUL_S))
     asyncio.run(server.serve(sockets=sockets))
+    manager.close()
     lock.close()
 
 

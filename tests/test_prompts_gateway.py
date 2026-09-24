@@ -77,6 +77,27 @@ def test_prompt_bad_name_refused(runner_env):
 
 @pytest.mark.component
 @pytest.mark.req("SPEC-GPU-003 §3")
+@pytest.mark.req("SPEC-GPU-003 §2.3")
+@pytest.mark.parametrize("name", ["a" * 49, "-coder", "Coder"], ids=["49-chars", "lead-dash", "uppercase"])
+def test_prompt_name_outside_rule_refused(runner_env, name):
+    """§3, §2.3: назва промпту — за правилом [a-z0-9][a-z0-9._-]{0,47}; поза ним → bad_name."""
+    expect_manager_error("bad_name", runner_env.prompts.save, name, CODER_TEXT, "alice")
+
+
+@pytest.mark.component
+@pytest.mark.req("SPEC-GPU-003 §3")
+@pytest.mark.req("SPEC-GPU-003 §2.3")
+def test_prompt_name_48_chars_accepted(runner_env):
+    """§3, §2.3: назва промпту з 48 символів — найдовша за правилом — зберігається."""
+    prompts = runner_env.prompts
+    name = "a" * 48
+    prompts.save(name, CODER_TEXT, "alice")
+    got = _text(prompts.get(name))
+    assert got == CODER_TEXT, f"get() of a prompt named with 48 chars: expected {CODER_TEXT!r}, got {got!r}"
+
+
+@pytest.mark.component
+@pytest.mark.req("SPEC-GPU-003 §3")
 def test_prompt_unknown_user_refused(runner_env):
     """§3: PromptStore отримує users — логін не з users.allowed → unknown_user."""
     expect_manager_error("unknown_user", runner_env.prompts.save, CODER, CODER_TEXT, STRANGER)

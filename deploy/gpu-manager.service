@@ -8,8 +8,8 @@ After=network-online.target
 
 [Service]
 WorkingDirectory=%h/gpu-manager
-# sg: менеджер systemd користувача стартував до додавання в групу gpuinbox і не передає її сервісам;
-# без групи сервер не читає файли зі спільної теки /srv/gpu-inbox.
+# sg: менеджер systemd користувача стартував до додавання в групу gpuinbox і не передає її сервісам, а група дає
+# сервісу доступ до спільної теки /srv/gpu-inbox. Без спільної теки: ExecStart=%h/gpu-manager/.venv/bin/python -m gpu_manager
 ExecStart=/usr/bin/sg gpuinbox -c "exec %h/gpu-manager/.venv/bin/python -m gpu_manager"
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure

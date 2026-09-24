@@ -1,15 +1,14 @@
 """Моделі на vLLM (фаза 3): запуск і зупинка на вказаній карті, автопорт, кілька моделей на карті, стан, логи.
 
-Кожна модель — окремий тимчасовий юніт systemd --user (gm-model-<name>), а не дочірній процес менеджера:
+Кожна модель — окремий тимчасовий юніт systemd --user (gm-model-<name>.service), а не дочірній процес менеджера:
 перезапуск менеджера (напр. після правки коду) не зупиняє моделей. Після перезавантаження машини юнітів
-немає — менеджер піднімає моделі, що мали працювати (п. 8 обговорення). Порт — найменший вільний з
-vllm.port_range (рішення користувача). Після першого успішного старту параметри запам'ятовуються як профіль
-моделі в data/model_profiles.json (читається при кожному старті — людина чи агент можуть вписати туди своє),
-і наступний старт без параметрів бере їх. Відомі помилки старту менеджер виправляє сам, до _MAX_ATTEMPTS спроб
-(рішення 19.1); невідомі — агентові: стан failed, підказка і лог.
+немає — менеджер піднімає моделі, що мали працювати. Порт — найменший вільний з vllm.port_range. Після першого
+успішного старту параметри запам'ятовуються як профіль моделі в data/model_profiles.json (читається при кожному
+старті — людина чи агент можуть вписати туди своє), і наступний старт без параметрів бере їх. Відомі помилки старту
+менеджер виправляє сам, до _MAX_ATTEMPTS спроб; невідомі — агентові: стан failed, підказка і лог.
 
-Замок тримається лише над станом у пам'яті: systemctl, HTTP і файли — поза ним, інакше повільний systemctl stop
-блокував би сторінку й потоки /v1 (знайдено ревʼю)."""
+Під замком — лише стан у пам'яті та запис state.json; systemctl, HTTP і лог-файли — поза ним, інакше повільний
+systemctl stop блокував би сторінку й потоки /v1."""
 
 from __future__ import annotations
 
@@ -17,6 +16,8 @@ import json
 import logging
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -29,6 +30,7 @@ import httpx
 
 from .config import Config
 from .core import GpuManager, require_user
+from .inbox import run_group
 from .journal import Journal
 from .messages import ManagerError
 from .models import ModelStore
@@ -41,7 +43,7 @@ SECTION = "servers"
 PROFILES_FILE = "model_profiles.json"
 # Скільки разів менеджер сам перезапускає модель з виправленими параметрами, перш ніж віддати агентові.
 _MAX_ATTEMPTS = 5
-# Драбина частки карти (рішення користувача): спершу максимум пам'яті, при нестачі — на щабель нижче.
+# Драбина частки карти: спершу максимум пам'яті, при нестачі — на щабель нижче.
 _FRACTION_LADDER = (1.0, 0.95, 0.92, 0.9)
 # Контекст при нестачі пам'яті без поради vLLM: удвічі менше, але не менше цього; не заданий -> це ×4.
 _MIN_AUTO_CTX = 2048
@@ -50,8 +52,10 @@ _MIN_USEFUL_CTX = 256
 STARTING, RUNNING, FAILED, STOPPED = "starting", "running", "failed", "stopped"
 _UNIT_PREFIX = "gm-model-"
 # Прапорці vLLM, які extra_args не можуть задати навіть скорочено (argparse приймає префікси, vLLM — `_` замість
-# `-`): адресою, портом, назвою й часткою керує менеджер; решта відкриває доступ до файлів чи ламає шлюз.
-_FORBIDDEN_FLAGS = ("--host", "--port", "--uds", "--served-model-name", "--gpu-memory-utilization", "--config",
+# `-`, а JSON-аргументи — ще й `--прапорець.ключ`): адресою, портом, назвою й пам'яттю керує менеджер (інакше
+# облік вільної частки карти хибний); решта відкриває доступ до файлів чи ламає шлюз.
+_FORBIDDEN_FLAGS = ("--host", "--port", "--uds", "--served-model-name", "--gpu-memory-utilization",
+                    "--kv-cache-memory-bytes", "--num-gpu-blocks-override", "--config",
                     "--allowed-local-media-path", "--allowed-media-domains", "--api-key", "--root-path",
                     "--ssl-keyfile", "--ssl-certfile", "--ssl-ca-certs", "--middleware")
 # Менша частка карти безглузда навіть для крихітної моделі (ваги + CUDA-графи): краще відмова, ніж певне падіння.
@@ -85,6 +89,14 @@ _ERROR_LINE = re.compile(r"\bERROR\b|Error\b|Exception\b|\bTraceback\b|\bfatal\b
 _MAMBA_SEQS = re.compile(r"exceeds available Mamba cache blocks \((\d+)\)")
 # Порада vLLM щодо довжини контексту в тексті помилки KV-кешу.
 _SUGGESTED_LEN = re.compile(r"estimated maximum model length is (\d+)")
+# Заданий контекст більший за межу моделі (напр. автоповтор поставив 8192 моделі з 4096): vLLM називає межу.
+_MODEL_LEN_LIMIT = re.compile(r"greater than the derived max_model_len \(\w+=(\d+)")
+
+
+def _unit(name: str) -> str:
+    """Юніт моделі з явним суфіксом: без нього systemctl дописує .service сам, і назви `x` та `x.service` вели б
+    до одного юніта — «прибрати» одну модель зупинило б іншу."""
+    return f"{_UNIT_PREFIX}{name}.service"
 
 
 class Launcher(Protocol):
@@ -102,9 +114,15 @@ class Probe(Protocol):
 
 
 class SystemdLauncher:
-    """Юніти через systemd-run --user; вивід — у файл логу (дописується)."""
+    """Юніти через systemd-run --user; вивід — у файл логу (дописується). group — запускати команду з цією групою
+    через sg (як і сам менеджер): так vLLM читає теки користувачів у теці файлів (inbox.run_group)."""
+
+    def __init__(self, group: str | None = None) -> None:
+        self._group = group
 
     def start(self, unit: str, argv: list[str], env: dict[str, str], log: Path) -> None:
+        if self._group:
+            argv = [shutil.which("sg") or "/usr/bin/sg", self._group, "-c", "exec " + shlex.join(argv)]
         subprocess.run(["systemctl", "--user", "reset-failed", unit], capture_output=True, check=False)
         cmd = ["systemd-run", "--user", f"--unit={unit}", "--collect",
                f"--property=StandardOutput=append:{log}", f"--property=StandardError=append:{log}",
@@ -190,7 +208,7 @@ def check_extra_args(args: Any) -> list[str]:
     for a in args:
         if not a.startswith("--"):
             continue
-        flag = a.split("=", 1)[0].replace("_", "-").lower()
+        flag = a.split("=", 1)[0].split(".", 1)[0].replace("_", "-").lower()
         if any(f.startswith(flag) for f in _FORBIDDEN_FLAGS if len(flag) > 2):
             raise ManagerError("bad_extra_args", flags=", ".join(_FORBIDDEN_FLAGS))
     return list(args)
@@ -229,7 +247,7 @@ class ModelRunner:
         self._journal = journal
         self._models = models
         self._gpus = gpus
-        self._launcher = launcher or SystemdLauncher()
+        self._launcher = launcher or SystemdLauncher(run_group(cfg.inbox_dir))
         self._probe = probe or HttpProbe()
         self._port_free = port_free
         self._clock = clock
@@ -263,7 +281,7 @@ class ModelRunner:
             check_name(name)
         ctx = max_model_len if max_model_len is not None else profile.get("max_model_len")
         with self._lock:
-            free = self._free_share(gpu, card)
+            free = self._free_share(gpu, card, cap=fraction is None)
             if fraction is not None:
                 if fraction > free + 1e-9:
                     raise ManagerError("gpu_memory_low", gpu=gpu, need_gib=round(card["memory_total_mib"] * fraction / 1024, 1),
@@ -288,6 +306,7 @@ class ModelRunner:
                 self._save()
             raise exc if isinstance(exc, ManagerError) else ManagerError("start_failed", detail=str(exc)[:300]) from exc
         self._journal.record(user, "model_start", name=srv.name, repo=repo, gpu=gpu, port=srv.port)
+        self._stop_if_unwanted(srv.name)
         return self._view(srv)
 
     def stop(self, name: str, user: str) -> dict[str, Any]:
@@ -303,7 +322,7 @@ class ModelRunner:
             else:
                 srv.want, srv.status, srv.usage = False, STOPPED, {}
             self._save()
-        stopped = self._launcher.stop(_UNIT_PREFIX + name)  # і для впалої: раптом юніт ще живий
+        stopped = self._launcher.stop(_unit(name))  # і для впалої: раптом юніт ще живий
         if stopped is False and not dismiss:
             with self._lock:
                 srv.want, srv.status = True, STARTING  # лишається під наглядом: poll побачить реальний стан
@@ -329,12 +348,13 @@ class ModelRunner:
         card = self._gpus.gpu(new_gpu)  # unknown_gpu — ще до зупинки
         if new_gpu != old.gpu:  # пам'ять нової карти — теж до зупинки, щоб не перезапускати модель даремно
             with self._lock:
-                free = self._free_share(new_gpu, card)
+                free = self._free_share(new_gpu, card, cap=not old.fraction_explicit)
             need = old.fraction if old.fraction_explicit else _MIN_FRACTION
             if need > free + 1e-9:
                 raise ManagerError("gpu_memory_low", gpu=new_gpu, need_gib=round(card["memory_total_mib"] * need / 1024, 1),
                                    free_gib=round(card["memory_total_mib"] * free / 1024, 1))
         self.stop(name, user)
+        self._fresh_sample()
         keep = {"fraction": old.fraction if old.fraction_explicit else None, "max_model_len": old.max_model_len,
                 "extra_args": old.extra_args, "name": name}
         try:
@@ -355,7 +375,7 @@ class ModelRunner:
         with self._lock:
             wanted = [s for s in self._items.values() if s.want]
         for srv in wanted:
-            if self._launcher.active(_UNIT_PREFIX + srv.name) is not False:
+            if self._launcher.active(_unit(srv.name)) is not False:
                 continue  # живий або невідомо — не чіпати
             try:
                 with self._lock:
@@ -380,7 +400,7 @@ class ModelRunner:
                 log.exception("poll of model %s failed; will retry", name)
 
     def _poll_one(self, name: str, port: int, started: float) -> None:
-        unit = _UNIT_PREFIX + name
+        unit = _unit(name)
         alive = self._launcher.active(unit)
         if alive is None:
             return
@@ -408,6 +428,8 @@ class ModelRunner:
                         cur.status, cur.want, cur.error_code = FAILED, False, "start_failed"
                         self._save()
                 log.warning("relaunch of %s failed: %s", name, exc)
+                return
+            self._stop_if_unwanted(name, snap.started)
             return
         healthy = self._probe.health(port)
         usage = self._probe.metrics(port) if healthy else {}
@@ -464,6 +486,29 @@ class ModelRunner:
 
     # ---- внутрішнє -------------------------------------------------------------------------------
 
+    def _stop_if_unwanted(self, name: str, started: float | None = None) -> None:
+        """Юніт щойно запущено, а модель тим часом зупинили: stop між записом starting і systemd-run бачив ще
+        неіснуючий юніт і вважав його зупиненим. Без цього лишився б vLLM, якого менеджер не бачить, з пам'яттю карти.
+        started — юніт автоповтору саме цього запуску: зупинити, якщо запис уже інший (напр. move вклинився).
+        Без started (перший старт) нова бажана копія з тією ж назвою — від move: її не чіпаємо."""
+        with self._lock:
+            if started is not None:
+                unwanted = self._current(name, started) is None
+            else:
+                srv = self._items.get(name)
+                unwanted = srv is None or not srv.want
+        if unwanted:
+            self._launcher.stop(_unit(name))
+
+    def _fresh_sample(self) -> None:
+        """Свіжий замір карт після зупинки моделі: секундний замір ще бачить її пам'ять, і новий старт на тій самій
+        карті (чи повернення при move) вирішив би, що пам'яті немає. systemctl stop повертається, коли всі процеси
+        юніта завершились, тож драйвер пам'ять уже звільнив. Невдалий замір — лишається попередній."""
+        try:
+            self._gpus.tick()
+        except Exception:
+            log.exception("fresh GPU sample after stop failed; using the previous one")
+
     def _current(self, name: str, started: float) -> Server | None:
         """Той самий запуск, що був у знімку: між знімком і рішенням модель могли зупинити чи перезапустити."""
         srv = self._items.get(name)
@@ -479,24 +524,34 @@ class ModelRunner:
                 "--served-model-name", srv.name, "--gpu-memory-utilization", str(srv.fraction),
                 # без журналу HTTP: менеджер питає /health і /metrics кожні 2 с, і лог перетворився б на шум
                 "--disable-uvicorn-access-log"]
+        if self._cfg.inbox_dir.is_dir():  # картинки, аудіо й відео з теки файлів модель читає сама (file://)
+            argv += ["--allowed-local-media-path", str(self._cfg.inbox_dir)]
         if srv.max_model_len:
             argv += ["--max-model-len", str(srv.max_model_len)]
-        # Для 1–3 користувачів 256 одночасних послідовностей vLLM — лише зайва пам'ять (рішення 25.2).
+        # Для 1–3 користувачів 256 одночасних послідовностей vLLM — лише зайва пам'ять.
         if not any(a.split("=", 1)[0].replace("_", "-") == "--max-num-seqs" for a in srv.extra_args):
             argv += ["--max-num-seqs", str(self._cfg.vllm_max_num_seqs)]
         argv += srv.extra_args
         cuda = str(self._cfg.vllm_cuda_home)
-        # CUDA_DEVICE_ORDER=PCI_BUS_ID: номер карти для CUDA збігається з номером NVML, яким карту перевіряли.
-        env = {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": str(srv.gpu), "HF_HOME": str(self._cfg.hf_home),
+        # CUDA_DEVICE_ORDER=PCI_BUS_ID: номер карти для CUDA збігається з номером NVML, яким карту перевіряли;
+        # UUID точніший за номер: CUDA не рахує відпалої карти, і номери решти для неї зсунулися б.
+        env = {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": self._cuda_id(srv.gpu), "HF_HOME": str(self._cfg.hf_home),
                "HF_HUB_OFFLINE": "1", "VLLM_NO_USAGE_STATS": "1", "CUDA_HOME": cuda, "PATH": f"{cuda}/bin:/usr/bin:/bin"}
-        self._launcher.start(_UNIT_PREFIX + srv.name, argv, env, log_path)
+        self._launcher.start(_unit(srv.name), argv, env, log_path)
+
+    def _cuda_id(self, gpu: int) -> str:
+        """UUID карти з NVML для CUDA_VISIBLE_DEVICES (vLLM і CUDA приймають UUID); номер — якщо UUID невідомий."""
+        try:
+            return self._gpus.gpu(gpu)["uuid"] or str(gpu)
+        except ManagerError:
+            return str(gpu)
 
     def _plan_fix(self, srv: Server, code: str, params: dict[str, Any]) -> str | None:
         """Відоме виправлення (під замком): змінює параметри й готує перезапуск з тим самим портом;
         None — виправлення немає або спроби вичерпано."""
         if srv.attempts >= _MAX_ATTEMPTS:
             return None
-        if code == "hint_kv_len":
+        if code in ("hint_kv_len", "hint_ctx_over_model"):
             srv.max_model_len, change = int(params["n"]), f"max_model_len={params['n']}"
         elif code in ("hint_gpu_memory_taken", "hint_oom") and (lower := self._lower_fraction(srv.fraction)):
             srv.fraction, change = lower, f"fraction={lower}"
@@ -522,14 +577,18 @@ class ModelRunner:
         srv.status, srv.started, srv.error_code, srv.error_params = STARTING, self._clock(), None, {}
         return change
 
-    def _free_share(self, gpu: int, card: dict[str, Any], exclude: str | None = None) -> float:
+    def _free_share(self, gpu: int, card: dict[str, Any], exclude: str | None = None, cap: bool = True) -> float:
         """Вільна частка карти: менше з телеметрії (з запасом) і з часток наших моделей на ній — ті, що ще
-        стартують, пам'ять ще не зайняли, але vLLM візьме свою частку. Донизу з кроком 0.01."""
+        стартують, пам'ять ще не зайняли, але vLLM візьме свою частку. Донизу з кроком 0.01. cap — ще й не більше
+        vllm.default_fraction: стеля лише для частки, яку вибирає менеджер; явну людина чи агент вибрали свідомо."""
         total = card["memory_total_mib"]
+        if not total:  # нечитна карта (NVML): пам'яті не знаємо — запуск на неї відмовить gpu_memory_low
+            return 0.0
         by_memory = (total - (card["memory_used_mib"] or 0) - _MEM_SLACK_MIB) / total
         by_models = 1.0 - sum(s.fraction for s in self._items.values()
                               if s.want and s.gpu == gpu and s.name != exclude)
-        return max(0.0, int(min(by_memory, by_models, self._cfg.vllm_default_fraction) * 100) / 100)
+        limit = self._cfg.vllm_default_fraction if cap else 1.0
+        return max(0.0, int(min(by_memory, by_models, limit) * 100) / 100)
 
     @staticmethod
     def _lower_fraction(current: float) -> float | None:
@@ -621,8 +680,12 @@ class ModelRunner:
         return text[text.rfind(_START_MARK):] if _START_MARK in text else text
 
     def _hint(self, name: str) -> tuple[str, dict[str, Any]]:
-        errors = "\n".join(ln for ln in self._last_run_log(name).splitlines() if _ERROR_LINE.search(ln))
+        text = self._last_run_log(name)
+        errors = "\n".join(ln for ln in text.splitlines() if _ERROR_LINE.search(ln))
         code = next((c for needle, c in _HINTS if needle in errors), "hint_see_logs")
+        limit = _MODEL_LEN_LIMIT.search(text)  # рядок pydantic «  Value error, User-specified …» не має слова Error
+        if limit:
+            return "hint_ctx_over_model", {"n": int(limit.group(1))}
         mamba = _MAMBA_SEQS.search(errors)
         if mamba:
             return "hint_mamba_seqs", {"n": int(mamba.group(1))}

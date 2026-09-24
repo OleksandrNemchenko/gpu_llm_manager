@@ -1,8 +1,7 @@
 """Моделі HuggingFace на диску: пошук, оцінка «чи влізе», завантаження, список, видалення (фаза 2).
 
 Завантаження — окремі процеси (download_worker) у черзі з обмеженням паралельності. Стан черги лежить у
-state.json, тож після перезапуску менеджера недокачане продовжується (п. 8 обговорення: «піднімати останню
-конфігурацію»). Прогрес рахується з диска: готові файли знімка + *.incomplete, поділені на розмір з API HF."""
+state.json, тож після перезапуску менеджера недокачане продовжується. Прогрес рахується з диска: готові файли знімка + *.incomplete, поділені на розмір з API HF."""
 
 from __future__ import annotations
 
@@ -22,9 +21,9 @@ from huggingface_hub import scan_cache_dir
 
 from .config import Config
 from .core import require_user
-from .hub import HubClient, estimate_fit
+from .hub import HubClient, estimate_fit, weight_bytes
 from .journal import Journal
-from .messages import ManagerError
+from .messages import EN, ManagerError
 from .store import StateStore
 
 SECTION = "downloads"
@@ -36,6 +35,9 @@ _SEARCH_MAX = 50
 _TERM_WAIT_S = 5
 # Скільки останніх байтів логу завантаження читати, щоб знайти рядок "ERROR ...".
 _LOG_TAIL_BYTES = 4096
+# Маркер початку кожної спроби в лозі завантаження: причину невдачі шукаємо лише після останнього, інакше
+# «No space left» з учорашньої спроби назвав би сьогоднішню 503 від HF нестачею диска.
+_DL_MARK = "=== gpu-manager download "
 # Клас винятку huggingface_hub у рядку ERROR -> код відмови для людини й агента.
 _ERROR_CODES = {"GatedRepoError": "hf_gated", "RepositoryNotFoundError": "hf_not_found",
                 "RevisionNotFoundError": "hf_not_found"}
@@ -52,6 +54,8 @@ class Download:
     finished: float | None = None
     error_code: str | None = None
     error: str | None = None
+    # Остання повна ревізія, поки качається (чи не докачалась) нова: модель лишається придатною до запуску.
+    ready_revision: str | None = None
 
     @property
     def total(self) -> int:
@@ -124,6 +128,8 @@ class ModelStore:
             if current is not None and current.status in _ACTIVE:
                 return self._view(current)
         sha, files, gated = self._hub.files(repo, revision)
+        if weight_bytes(files) == 0:  # напр. лише GGUF: «завантажилось» би за секунду, а запустити нічого
+            raise ManagerError("no_vllm_weights", repo=repo)
         if gated:
             self._hub.check_access(repo)
         need = max(0, sum(files.values()) - self._bytes_done(repo, sha, files))
@@ -135,12 +141,12 @@ class ModelStore:
                 self._items[repo] = d
                 self._save()
             return self._view(d)
-        free = shutil.disk_usage(self._existing_parent(self._cfg.hf_home)).free
-        if free - need < self._cfg.min_free_disk_gib * _GIB:
-            raise ManagerError("disk_full", need_gib=round(need / _GIB, 1), free_gib=round(free / _GIB, 1),
-                               reserve_gib=self._cfg.min_free_disk_gib)
+        self._check_disk(need, repo)
         with self._lock:
-            d = Download(repo=repo, revision=sha, user=user, files=files, status=QUEUED, started=self._clock())
+            prev = self._items.get(repo)
+            ready = prev.revision if prev is not None and prev.status == DONE else (prev.ready_revision if prev else None)
+            d = Download(repo=repo, revision=sha, user=user, files=files, status=QUEUED, started=self._clock(),
+                         ready_revision=ready if ready != sha else None)
             self._items[repo] = d
             self._save()
         self._journal.record(user, "download", repo=repo, size_gib=round(d.total / _GIB, 2))
@@ -184,8 +190,15 @@ class ModelStore:
                 if len(self._procs) >= self._cfg.max_parallel_downloads:
                     break
                 if d.status == QUEUED and d.repo not in self._procs:
-                    self._start(d)
                     changed = True
+                    try:  # місце могло зникнути, поки завантаження чекало в черзі
+                        self._check_disk(max(0, d.total - self._bytes_done(d.repo, d.revision, d.files)), d.repo,
+                                         (DOWNLOADING,))
+                    except ManagerError as exc:
+                        d.status, d.finished, d.error_code, d.error = FAILED, self._clock(), exc.code, exc.text(EN)
+                        self._journal.record(d.user, "download_failed", repo=d.repo, error=exc.code)
+                        continue
+                    self._start(d)
             if changed:
                 self._save()
 
@@ -211,6 +224,8 @@ class ModelStore:
             env["HF_TOKEN"] = token
         log = open(self._log_path(d.repo), "ab")  # noqa: SIM115 — дескриптор успадковує процес
         try:
+            log.write(f"{_DL_MARK}{time.strftime('%Y-%m-%d %H:%M:%S')} revision={d.revision} ===\n".encode())
+            log.flush()
             proc = self._spawn([sys.executable, "-m", "gpu_manager.download_worker"], stdin=subprocess.PIPE,
                                stdout=log, stderr=log, env=env, cwd=str(Path(__file__).resolve().parent.parent))
         finally:
@@ -239,11 +254,25 @@ class ModelStore:
                 tail = f.read().decode("utf-8", "replace")
         except OSError:
             tail = ""
+        if _DL_MARK in tail:
+            tail = tail[tail.rfind(_DL_MARK):]
         line = next((ln for ln in reversed(tail.splitlines()) if ln.startswith("ERROR ")), "")
         cls = line[len("ERROR "):].split(":", 1)[0] if line else ""
         if "No space left" in tail:
             return "disk_full_during", line[:300]
         return _ERROR_CODES.get(cls, "download_failed"), (line or tail[-300:]).strip()[:300]
+
+    def _check_disk(self, need: int, repo: str, counted: tuple[str, ...] = _ACTIVE) -> None:
+        """disk_full, якщо після need байтів і залишку інших завантажень у станах counted лишиться менше запасу: кожне
+        окремо влазило б, а разом черга заповнила б диск, на якому ще й state.json з журналом. Перед запуском з черги
+        рахуються лише ті, що вже качаються: молодші в черзі перевірять себе самі, коли дійде їхня черга."""
+        with self._lock:
+            others = [x for r, x in self._items.items() if r != repo and x.status in counted]
+        pending = sum(max(0, x.total - self._bytes_done(x.repo, x.revision, x.files)) for x in others)
+        free = shutil.disk_usage(self._existing_parent(self._cfg.hf_home)).free
+        if free - need - pending < self._cfg.min_free_disk_gib * _GIB:
+            raise ManagerError("disk_full", need_gib=round((need + pending) / _GIB, 1), free_gib=round(free / _GIB, 1),
+                               reserve_gib=self._cfg.min_free_disk_gib)
 
     def _log_path(self, repo: str) -> Path:
         return self._log_dir / f"{_repo_dir_name(repo)}.log"
@@ -290,8 +319,9 @@ class ModelStore:
             if r.repo_type != "model":
                 continue
             d = items.get(r.repo_id)
-            state = "ready" if d is None or d.status == DONE else ("downloading" if d.status in _ACTIVE else "partial")
             revs = {x.commit_hash: x for x in r.revisions}
+            ready = d is None or d.status == DONE or d.ready_revision in revs
+            state = "ready" if ready else ("downloading" if d is not None and d.status in _ACTIVE else "partial")
             out.append({"repo": r.repo_id, "size_gib": round(r.size_on_disk / _GIB, 2),
                         "revisions": sorted(revs), "revision": self._pick_revision(r.repo_path, revs, d),
                         "state": state, "last_modified": r.last_modified})
@@ -323,10 +353,12 @@ class ModelStore:
 
     @staticmethod
     def _pick_revision(repo_path: Path, revs: dict[str, Any], d: Download | None) -> str:
-        """Яку ревізію запускати: докачану менеджером -> на яку вказує refs/main -> найновішу. Без цього
+        """Яку ревізію запускати: докачану менеджером (чи останню повну) -> на яку вказує refs/main -> найновішу. Без цього
         вибір з frozenset був би випадковим, і могла б запуститися стара чи неповна ревізія."""
         if d is not None and d.status == DONE and d.revision in revs:
             return d.revision
+        if d is not None and d.ready_revision is not None and d.ready_revision in revs:
+            return d.ready_revision  # нова ревізія ще не повна — запускається попередня
         try:
             main = (repo_path / "refs" / "main").read_text(encoding="utf-8").strip()
         except OSError:

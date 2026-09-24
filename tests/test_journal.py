@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 import pytest
@@ -14,6 +15,8 @@ from .conftest import (
     N_GPUS,
     STRANGER,
     T0,
+    USERS,
+    card,
     journal,
     ok_json,
     refusal,
@@ -163,6 +166,88 @@ def test_journal_default_limit_is_30(env):
         order = _purposes(journal(c))
     expected = [f"p{k}" for k in range(31, 1, -1)]
     assert order == expected, f"journal without limit: expected 30 newest {expected[:2]}..{expected[-1:]}, got {order!r}"
+
+
+# --- Порядок одночасних змін (§5) -----------------------------------------------------------------------------
+
+ROUNDS = 10  # спроб «забронювати й звільнити» на кожного користувача; число обране тестом
+THREAD_TIMEOUT_S = 120  # запобіжник від зависання потоку, не вимога специфікації
+
+
+def _contend(client: Any, user: str, barrier: threading.Barrier, done: list[str], problems: list[str]) -> None:
+    """Потік користувача user: ROUNDS разів бронює gpu 0 і, якщо вдалося, одразу звільняє.
+
+    done — сюди додається user після кожної успішної пари reserve/release; problems — будь-яка
+    несподівана відповідь або виняток (reserved_by_other — очікувана відповідь, бо карта спільна).
+    """
+    try:
+        barrier.wait(timeout=THREAD_TIMEOUT_S)
+        for k in range(ROUNDS):
+            resp = reserve(client, 0, user, purpose=f"{user}-{k}")
+            if resp.status_code == 200:
+                rel = release(client, 0, user)
+                body = rel.json() if rel.status_code == 200 else None
+                if not (isinstance(body, dict) and body.get("released") is True):
+                    problems.append(f"{user} release after own reserve: HTTP {rel.status_code} {rel.text[:200]}")
+                    return
+                done.append(user)
+            elif resp.status_code != 400 or resp.json().get("code") != "reserved_by_other":
+                problems.append(f"{user} reserve: HTTP {resp.status_code} {resp.text[:200]}")
+                return
+    except Exception as exc:  # noqa: BLE001 — виняток потоку має дійти до assert тесту
+        problems.append(f"{user}: {exc!r}")
+
+
+def _replay(entries_oldest_first: list[dict[str, Any]]) -> list[str]:
+    """Прокручує журнал gpu 0 від найстарішого запису; повертає суперечності порядку.
+
+    reserve можливе лише на вільній карті, release — лише власником: журнал, у якому запис однієї зміни
+    обігнав запис іншої, дає тут суперечність.
+    """
+    holder: str | None = None
+    wrong: list[str] = []
+    for i, entry in enumerate(entries_oldest_first):
+        action, user = entry.get("action"), entry.get("user")
+        if action == "reserve" and holder is None:
+            holder = user
+        elif action == "release" and holder == user:
+            holder = None
+        else:
+            wrong.append(f"#{i} {action} by {user} while holder={holder}")
+    return wrong
+
+
+@pytest.mark.req("SPEC-GPU-001 §5")
+def test_journal_order_matches_concurrent_changes(env):
+    """§5: записи йдуть у порядку змін бронювань — одночасні дії різних людей не міняються місцями.
+
+    Чотири потоки одночасно бронюють і звільняють ту саму карту. Правильна реалізація проходить завжди:
+    перевірка — інваріант журналу, а не таймінг. Неправильна (запис у журнал поза тим самим кроком, що й
+    зміна) ловиться не з кожного прогону.
+    """
+    barrier = threading.Barrier(len(USERS))
+    done: list[str] = []
+    problems: list[str] = []
+    with env.client() as c:
+        threads = [
+            threading.Thread(target=_contend, args=(c, user, barrier, done, problems), name=user) for user in USERS
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=THREAD_TIMEOUT_S)
+        hung = [t.name for t in threads if t.is_alive()]
+        entries = journal(c, limit=2 * len(USERS) * ROUNDS + 10)
+        final = card(c, 0)["reservation"]
+    assert not hung and not problems, f"precondition: expected every thread to finish cleanly, hung {hung}, problems {problems}"
+    assert len(entries) == 2 * len(done), (
+        f"journal: expected {2 * len(done)} entries for {len(done)} reserve/release pairs, got {len(entries)}"
+    )
+    wrong = _replay(list(reversed(entries)))
+    assert not wrong and final is None, (
+        f"journal replay of concurrent changes: expected a consistent sequence ending with gpu 0 free, "
+        f"got contradictions {wrong[:5]} (of {len(wrong)}), final reservation {final!r}"
+    )
 
 
 # --- Файл (§5) -------------------------------------------------------------------------------------------------

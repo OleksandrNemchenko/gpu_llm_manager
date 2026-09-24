@@ -9,11 +9,11 @@ an agent gateway. Two front ends over the same core: web page (humans, phone) an
 3. vLLM: a model per systemd --user unit `gm-model-<name>` (survives manager restarts); auto port = lowest free in
    `vllm.port_range`; several models per GPU; defaults = all free memory + model's max context; known start
    failures auto-retried; good params → `data/model_profiles.json` — done.
-4. Agents: gateway `/v1` by model name, `model@prompt` = named system prompt, MCP `llm_ask` — done.
+4. Agents: gateway `/v1` by model name, `model@prompt` = named system prompt, MCP `llm_ask`; page chat — done.
 
 ## Layout
 - `gpu_manager/core.py` GPU facade · `models.py` + `hub.py` HF models · `runner.py` vLLM units · `gateway.py` +
-  `prompts.py` agent access · `web*.py` page API · `mcp_*.py` MCP tools ·
+  `prompts.py` agent access · `web*.py` page API · `pdfconvert.py` chat PDF → text/images · `mcp_*.py` MCP tools ·
   `messages.py` refusal codes (en + uk) · `static/index.html` the page · `agent_guide.md` text of MCP `gpu_guide`.
 - `docs/specs/SPEC-GPU-00N-*.md` — behaviour + interface contract per phase.
 - `deploy/gpu-manager.service` — systemd --user unit.

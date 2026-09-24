@@ -1,4 +1,5 @@
-"""§4 SPEC-GPU-003: HTTP-маршрути серверів моделей і MCP-інструменти фаз 3–4; поле models картки GPU (§2.12).
+"""§4 SPEC-GPU-003: HTTP-маршрути серверів моделей і MCP-інструменти фаз 3–4; поле models картки GPU (§2.12);
+конвертація PDF для чату сторінки — POST /api/convert/pdf (§5; PDF будуються в тесті через pypdfium2).
 
 HTTP — starlette TestClient над build_app(cfg, manager, models, runner, prompts) у режимі контекстного
 менеджера (lifespan працює; захист і формат відмов — SPEC-GPU-001 §7). MCP — у процесі, build_mcp(...,
@@ -9,7 +10,12 @@ runner=, prompts=) (SPEC-GPU-001 §10): відмова піднімає ToolErro
 
 from __future__ import annotations
 
+import base64
+import io
 import json
+import random
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import anyio
@@ -26,6 +32,7 @@ from .runner_fakes import (
     NOT_LOCAL_REPO,
     PORT_FIRST,
     STUB_ANSWER,
+    STUB_COMPLETION,
     fraction_of,
     max_len_of,
     port_of,
@@ -75,7 +82,7 @@ def _tool_names(server: Any) -> set[str]:
 @pytest.mark.e2e
 @pytest.mark.req("SPEC-GPU-003 §4")
 def test_http_start_launches_unit(runner_env):
-    """§4: POST /api/servers/start {repo, gpu, user} → 200 і запуск юніта gm-model-<name>."""
+    """§4: POST /api/servers/start {repo, gpu, user} → 200 і запуск юніта gm-model-<name>.service."""
     env = runner_env
     with env.client() as c:
         ok_json(c.post(START, json={"repo": REPO, "gpu": GPU, "user": "alice"}), "POST /api/servers/start")
@@ -126,8 +133,8 @@ def test_http_move(runner_env):
     with env.client() as c:
         ok_json(c.post(MOVE, json={"name": NAME, "user": "alice", "gpu": GPU_B, "port": PORT_FIRST + 10}), "POST /api/servers/move")
     last = env.starts(NAME)[-1]
-    got = (len(env.starts(NAME)), last.env.get("CUDA_VISIBLE_DEVICES"), port_of(last.argv))
-    expected = (2, str(GPU_B), PORT_FIRST + 10)
+    got = (len(env.starts(NAME)), env.gpu_of(last), port_of(last.argv))
+    expected = (2, GPU_B, PORT_FIRST + 10)
     assert got == expected, f"after POST {MOVE}: expected (starts, gpu, port) {expected!r}, got {got!r}"
 
 
@@ -278,8 +285,8 @@ def test_mcp_model_move(runner_env):
     env.ensure_running(NAME)
     mcp_call(env.mcp(), "model_move", {"name": NAME, "user": "alice", "gpu": GPU_B})
     last = env.starts(NAME)[-1]
-    got = (len(env.starts(NAME)), last.env.get("CUDA_VISIBLE_DEVICES"))
-    assert got == (2, str(GPU_B)), f"after model_move to gpu {GPU_B}: expected (2 starts, gpu {GPU_B}), got {got!r}"
+    got = (len(env.starts(NAME)), env.gpu_of(last))
+    assert got == (2, GPU_B), f"after model_move to gpu {GPU_B}: expected (2 starts, gpu {GPU_B}), got {got!r}"
 
 
 @pytest.mark.component
@@ -364,3 +371,177 @@ def test_mcp_llm_ask_default_sampling(proxied_env, upstream):
     sent = upstream.last_json() or {}
     got = (sent.get("max_tokens"), sent.get("temperature"))
     assert got == (1024, 0.2), f"llm_ask request seen by the model: expected (max_tokens, temperature) (1024, 0.2), got {json.dumps(sent)[:400]}"
+
+
+def _completion_without_text(content: Any) -> dict[str, Any]:
+    """Відповідь моделі у форматі STUB_COMPLETION, де content — content (без тексту), finish_reason — length."""
+    choice = {"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "length"}
+    return {**STUB_COMPLETION, "choices": [choice]}
+
+
+@pytest.mark.e2e
+@pytest.mark.req("SPEC-GPU-003 §4")
+@pytest.mark.parametrize("content", ["", None], ids=["empty-string", "null"])
+def test_mcp_llm_ask_empty_answer_refused(proxied_env, upstream, content):
+    """§4: модель не дала тексту (content порожній або null) → llm_ask відмовляє: ToolError з кодом empty_answer."""
+    upstream.response = _completion_without_text(content)
+    message = mcp_refusal(proxied_env.mcp(), "llm_ask", {"model": NAME, "prompt": "2+2?"})
+    assert "empty_answer" in message, f"llm_ask on an answer with content {content!r}: expected a refusal with 'empty_answer', got {message!r}"
+
+
+# --- §5 конвертація PDF ---------------------------------------------------------------------------------------------------
+
+CONVERT = "/api/convert/pdf"
+JPEG_URL_PREFIX = "data:image/jpeg;base64,"  # §5: images — data URL JPEG
+PDF_MAX_SIDE_PX = 2000  # §5: сторінка-картинка — не більше 2000 px по довшій стороні
+SMALL_PAGE_PT = (72.0, 72.0)  # мала сторінка (1 × 1 дюйм): картинки з неї дешеві навіть для 100 сторінок
+HUGE_PAGE_PT = (20000.0, 20000.0)  # у 72 dpi це 20000 px по стороні — удесятеро більше за межу §5
+RANDOM_SEED = 0x5EED  # сід випадкових байтів «не PDF»
+NOT_PDF_DATA = {
+    "random-bytes": base64.b64encode(random.Random(RANDOM_SEED).randbytes(4096)).decode("ascii"),
+    "not-base64": "%%% not base64 %%%",
+}
+
+
+def _pdf(pages: int, size: tuple[float, float] = SMALL_PAGE_PT) -> bytes:
+    """PDF з pages порожніх сторінок розміром size (pt), зібраний pypdfium2 у пам'яті.
+
+    Викликається лише з головного потоку тесту: pdfium не потокобезпечний."""
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument.new()
+    buffer = io.BytesIO()
+    try:
+        for _ in range(pages):
+            pdf.new_page(*size).close()
+        pdf.save(buffer)
+    finally:
+        pdf.close()
+    return buffer.getvalue()
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def _data_url(data: bytes) -> str:
+    return "data:application/pdf;base64," + _b64(data)
+
+
+def _convert(client: Any, data: str, mode: str) -> Any:
+    """POST /api/convert/pdf {data, mode} (§5)."""
+    return client.post(CONVERT, json={"data": data, "mode": mode})
+
+
+def _jpeg(url: Any) -> tuple[Any, tuple[int, int]]:
+    """Формат і розмір (px) картинки з data URL JPEG, розібраної Pillow; не такий data URL — помилка тесту."""
+    from PIL import Image
+
+    assert isinstance(url, str) and url.startswith(JPEG_URL_PREFIX), (
+        f"page image: expected a {JPEG_URL_PREFIX!r}... data URL, got {str(url)[:80]!r}"
+    )
+    with Image.open(io.BytesIO(base64.b64decode(url[len(JPEG_URL_PREFIX):]))) as img:
+        return img.format, img.size
+
+
+def _images(body: Any) -> list[Any]:
+    images = body.get("images") if isinstance(body, dict) else None
+    assert isinstance(images, list), f"{CONVERT} images: expected {{pages, images: [...]}}, got {str(body)[:300]}"
+    return images
+
+
+@pytest.mark.e2e
+@pytest.mark.req("SPEC-GPU-003 §5")
+@pytest.mark.parametrize("form", ["data-url", "base64"])
+def test_convert_pdf_text_pages_marked(runner_env, form):
+    """§5: mode text → {pages, text}, сторінки в тексті позначені [page N] по порядку; data — data URL або base64."""
+    pdf = _pdf(2)
+    data = _data_url(pdf) if form == "data-url" else _b64(pdf)
+    with runner_env.client() as c:
+        body = ok_json(_convert(c, data, "text"), f"POST {CONVERT} mode text")
+    text = body.get("text") if isinstance(body, dict) else None
+    first = text.find("[page 1]") if isinstance(text, str) else -1
+    second = text.find("[page 2]") if isinstance(text, str) else -1
+    got = (body.get("pages") if isinstance(body, dict) else None, 0 <= first < second)
+    assert got == (2, True), f"2-page PDF as {form}, mode text: expected pages 2 and '[page 1]' before '[page 2]', got {str(body)[:300]}"
+
+
+@pytest.mark.e2e
+@pytest.mark.req("SPEC-GPU-003 §5")
+def test_convert_pdf_images_are_jpeg_data_urls(runner_env):
+    """§5: mode images → {pages, images}; кожна сторінка — data URL JPEG, що розбирається як JPEG."""
+    with runner_env.client() as c:
+        body = ok_json(_convert(c, _b64(_pdf(2)), "images"), f"POST {CONVERT} mode images")
+    got = (body.get("pages"), [_jpeg(url)[0] for url in _images(body)])
+    assert got == (2, ["JPEG", "JPEG"]), f"2-page PDF, mode images: expected (pages, image formats) (2, ['JPEG', 'JPEG']), got {got!r}"
+
+
+@pytest.mark.e2e
+@pytest.mark.req("SPEC-GPU-003 §5")
+def test_convert_pdf_huge_page_at_most_2000px(runner_env):
+    """§5: сторінка 20000 × 20000 pt рендериться не більше ніж 2000 px по довшій стороні."""
+    with runner_env.client() as c:
+        body = ok_json(_convert(c, _b64(_pdf(1, HUGE_PAGE_PT)), "images"), f"POST {CONVERT} huge page")
+    images = _images(body)
+    assert len(images) == 1, f"1-page PDF: expected 1 image, got {len(images)}"
+    _, size = _jpeg(images[0])
+    assert 0 < max(size) <= PDF_MAX_SIDE_PX, f"image of a {HUGE_PAGE_PT} pt page: expected the longer side 1..{PDF_MAX_SIDE_PX} px, got {size} px"
+
+
+@pytest.mark.e2e
+@pytest.mark.req("SPEC-GPU-003 §5")
+@pytest.mark.parametrize("case", sorted(NOT_PDF_DATA))
+def test_convert_pdf_not_pdf_refused(runner_env, case):
+    """§5: data — не PDF (випадкові байти, сід 0x5EED) або не base64 → 400 bad_pdf."""
+    with runner_env.client() as c:
+        refusal(_convert(c, NOT_PDF_DATA[case], "text"), "bad_pdf")
+
+
+@pytest.mark.e2e
+@pytest.mark.req("SPEC-GPU-003 §5")
+@pytest.mark.parametrize(("mode", "pages"), [("images", 101), ("text", 501)], ids=["images-101", "text-501"])
+def test_convert_pdf_too_many_pages_refused(runner_env, mode, pages):
+    """§5: сторінок понад 100 для images чи понад 500 для text → 400 bad_pdf."""
+    with runner_env.client() as c:
+        refusal(_convert(c, _b64(_pdf(pages)), mode), "bad_pdf")
+
+
+@pytest.mark.e2e
+@pytest.mark.req("SPEC-GPU-003 §5")
+@pytest.mark.parametrize(("mode", "pages"), [("images", 100), ("text", 500)], ids=["images-100", "text-500"])
+def test_convert_pdf_page_limit_accepted(runner_env, mode, pages):
+    """§5: рівно 100 сторінок для images і 500 для text — ще можна."""
+    with runner_env.client() as c:
+        body = ok_json(_convert(c, _b64(_pdf(pages)), mode), f"POST {CONVERT} {pages} pages, mode {mode}")
+    got = body.get("pages") if isinstance(body, dict) else body
+    assert got == pages, f"{pages}-page PDF, mode {mode}: expected pages {pages}, got {got!r}"
+
+
+def _pages_and_images(resp: Any) -> Any:
+    """(HTTP-код, pages, кількість images) відповіді конвертації; не JSON-об'єкт — текст для повідомлення."""
+    if resp.status_code != 200:
+        return (resp.status_code, resp.text[:200])
+    body = resp.json()
+    if not isinstance(body, dict):
+        return (resp.status_code, str(body)[:200])
+    images = body.get("images")
+    return (resp.status_code, body.get("pages"), len(images) if isinstance(images, list) else images)
+
+
+@pytest.mark.e2e
+@pytest.mark.req("SPEC-GPU-003 §5")
+def test_convert_pdf_concurrent_both_succeed(runner_env):
+    """§5: дві конвертації, надіслані одночасно, обидві вдаються, і кожна отримує свої сторінки (2 і 3)."""
+    pdfs = {pages: _b64(_pdf(pages)) for pages in (2, 3)}  # PDF — до потоків: pdfium не потокобезпечний
+    barrier = threading.Barrier(len(pdfs), timeout=30)  # обидва запити вирушають разом; тайм-аут — від зависання
+    with runner_env.client() as c:
+
+        def _post(pages: int) -> Any:
+            barrier.wait()
+            return _convert(c, pdfs[pages], "images")
+
+        with ThreadPoolExecutor(max_workers=len(pdfs)) as pool:
+            futures = {pages: pool.submit(_post, pages) for pages in pdfs}
+            got = {pages: _pages_and_images(future.result(timeout=120)) for pages, future in futures.items()}
+    expected = {2: (200, 2, 2), 3: (200, 3, 3)}
+    assert got == expected, f"two concurrent conversions: expected {{pages: (HTTP, pages, images)}} {expected!r}, got {got!r}"

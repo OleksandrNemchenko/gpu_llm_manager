@@ -1,10 +1,11 @@
 """Бронювання карт: хто позначив карту як зайняту, навіщо і до коли.
 
-Прострочене бронювання лише позначається, але не знімається само (рішення з обговорення): тихо звільнити
+Прострочене бронювання лише позначається, але не знімається само: тихо звільнити
 карту посеред чийогось навчання гірше, ніж показати застарілу позначку."""
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -15,6 +16,9 @@ from .store import StateStore
 
 SECTION = "reservations"
 _SECONDS_PER_HOUR = 3600
+# Найдовший строк, годин (рік): довший — описка; «безстроково» — hours не задано. Без межі inf/NaN чи 1e8 годин
+# потрапляли в state.json і ламали показ бронювання для всіх (JSON не має Infinity, datetime — року понад 9999).
+MAX_HOURS = 8760
 
 
 @dataclass(frozen=True)
@@ -52,8 +56,8 @@ class ReservationBook:
 
         hours — строк у годинах або None; повертає (нове, попереднє). Повторне бронювання тим самим
         користувачем оновлює мету й строк, зберігаючи since. Чуже — ManagerError reserved_by_other."""
-        if hours is not None and hours <= 0:
-            raise ManagerError("bad_hours")
+        if hours is not None and not (math.isfinite(hours) and 0 < hours <= MAX_HOURS):
+            raise ManagerError("bad_hours", max=MAX_HOURS)
         with self._lock:
             current = self._items.get(gpu)
             if current is not None and current.user != user:

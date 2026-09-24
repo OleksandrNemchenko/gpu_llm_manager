@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 import anyio
@@ -324,6 +325,41 @@ def test_gpu_reserve_bool_gpu_refused(server, gpu):
     reserved = [g.get("gpu") for g in mcp_json(server, "gpu_status")["gpus"] if g.get("reservation")]
     assert "unknown_gpu: " in message and reserved == [], (
         f"gpu={gpu!r}: expected ToolError 'unknown_gpu: ...' and no reservations, got {message!r}, reserved {reserved!r}"
+    )
+
+
+@pytest.mark.component
+@pytest.mark.req("SPEC-GPU-001 §8.4")
+@pytest.mark.req("SPEC-GPU-001 §4.4")
+@pytest.mark.parametrize(
+    "hours", [9000, math.inf, -math.inf, math.nan], ids=["over-year", "inf", "minus-inf", "nan"]
+)
+def test_gpu_reserve_bad_hours_refused(server, hours):
+    """§4.4, §8.4: gpu_reserve з hours > 8760 або не скінченним → bad_hours; карта не заброньована.
+
+    inf і nan — числа Python у виклику в процесі: так до інструмента доходить JSON-число 1e309 агента.
+    """
+    message = mcp_refusal(server, "gpu_reserve", {"gpu": 1, "user": "alice", "hours": hours})
+    reservation = _short_card(server, 1)["reservation"]
+    assert "bad_hours: " in message and reservation is None, (
+        f"gpu_reserve hours={hours!r}: expected ToolError 'bad_hours: ...' and no reservation, "
+        f"got {message!r}, reservation {reservation!r}"
+    )
+
+
+@pytest.mark.component
+@pytest.mark.req("SPEC-GPU-001 §8.4")
+@pytest.mark.req("SPEC-GPU-001 §4.4")
+def test_gpu_reserve_string_inf_hours_not_reserved(server):
+    """§4.4, §8.4: hours = "inf" рядком не бронює карту.
+
+    Тип параметра hours у MCP §8 не задає: інструмент може відмовити й на перевірці типу, тож код
+    відмови тут не звіряється — лише те, що це відмова і бронювання немає.
+    """
+    message = mcp_refusal(server, "gpu_reserve", {"gpu": 1, "user": "alice", "hours": "inf"})
+    reservation = _short_card(server, 1)["reservation"]
+    assert reservation is None, (
+        f"gpu_reserve hours='inf': expected no reservation after the refusal {message!r}, got {reservation!r}"
     )
 
 

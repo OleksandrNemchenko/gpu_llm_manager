@@ -19,4 +19,4 @@ def check_name(name: str) -> str:
 
 def slug(text: str) -> str:
     """Назва з довільного тексту (остання частина repo): малі літери, заборонене -> '-'."""
-    return re.sub(r"[^a-z0-9._-]", "-", text.lower())[:40].strip("-.") or "model"
+    return re.sub(r"[^a-z0-9._-]", "-", text.lower())[:40].strip("-._") or "model"  # перший символ — лише a-z0-9

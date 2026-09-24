@@ -94,7 +94,16 @@ class NvmlBackend:
 
         self._nvml = pynvml
         pynvml.nvmlInit()
-        self._handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(pynvml.nvmlDeviceGetCount())]
+        # Карта, що відпала від шини, до перезавантаження машини не віддає навіть handle. Без неї сервіс падав би
+        # при кожному старті, і решта карт з їхніми моделями лишалися б без сторінки, MCP і шлюзу /v1.
+        self._handles: list[Any] = []
+        self._lost: dict[int, str] = {}  # номер карти -> текст помилки NVML
+        for i in range(pynvml.nvmlDeviceGetCount()):
+            try:
+                self._handles.append(pynvml.nvmlDeviceGetHandleByIndex(i))
+            except pynvml.NVMLError as exc:
+                self._handles.append(None)
+                self._lost[i] = str(exc)
 
     def _try(self, fn: Any, *args: Any) -> Any:
         try:
@@ -114,31 +123,43 @@ class NvmlBackend:
         n = self._nvml
         out = []
         for i, h in enumerate(self._handles):
-            limit = self._try(n.nvmlDeviceGetEnforcedPowerLimit, h)
-            ecc = self._try(n.nvmlDeviceGetEccMode, h)
-            cc = self._try(n.nvmlDeviceGetCudaComputeCapability, h)
-            pci = self._try(n.nvmlDeviceGetPciInfo, h)
-            out.append(
-                GpuInfo(
-                    index=i,
-                    name=_text(n.nvmlDeviceGetName(h)),
-                    uuid=_text(n.nvmlDeviceGetUUID(h)),
-                    pci_bus_id=_text(pci.busId) if pci is not None else "",
-                    memory_total_mib=self._memory(h).total // _MIB,
-                    power_limit_w=limit / 1000 if limit is not None else None,
-                    ecc_enabled=bool(ecc[0]) if ecc is not None else None,
-                    compute_capability=f"{cc[0]}.{cc[1]}" if cc is not None else None,
-                    temp_slowdown_c=self._try(
-                        n.nvmlDeviceGetTemperatureThreshold, h, n.NVML_TEMPERATURE_THRESHOLD_SLOWDOWN
-                    ),
-                )
-            )
+            try:
+                if h is not None:
+                    out.append(self._info_one(i, h))
+                    continue
+            except n.NVMLError:
+                pass
+            # Нечитна карта лишається під своїм номером: інакше зсунулися б номери решти карт.
+            out.append(GpuInfo(index=i, name="unknown", uuid="", pci_bus_id="", memory_total_mib=0, power_limit_w=None,
+                               ecc_enabled=None, compute_capability=None, temp_slowdown_c=None))
         return out
+
+    def _info_one(self, i: int, h: Any) -> GpuInfo:
+        """Постійні дані однієї карти; назва, UUID і пам'ять обов'язкові (NVMLError — карта нечитна)."""
+        n = self._nvml
+        limit = self._try(n.nvmlDeviceGetEnforcedPowerLimit, h)
+        ecc = self._try(n.nvmlDeviceGetEccMode, h)
+        cc = self._try(n.nvmlDeviceGetCudaComputeCapability, h)
+        pci = self._try(n.nvmlDeviceGetPciInfo, h)
+        return GpuInfo(
+            index=i,
+            name=_text(n.nvmlDeviceGetName(h)),
+            uuid=_text(n.nvmlDeviceGetUUID(h)),
+            pci_bus_id=_text(pci.busId) if pci is not None else "",
+            memory_total_mib=self._memory(h).total // _MIB,
+            power_limit_w=limit / 1000 if limit is not None else None,
+            ecc_enabled=bool(ecc[0]) if ecc is not None else None,
+            compute_capability=f"{cc[0]}.{cc[1]}" if cc is not None else None,
+            temp_slowdown_c=self._try(n.nvmlDeviceGetTemperatureThreshold, h, n.NVML_TEMPERATURE_THRESHOLD_SLOWDOWN),
+        )
 
     def sample(self, ts: float) -> list[GpuSample]:
         n = self._nvml
         out = []
         for i, h in enumerate(self._handles):
+            if h is None:
+                out.append(GpuSample(i, ts, None, None, None, None, error=self._lost[i]))
+                continue
             try:
                 util = self._try(n.nvmlDeviceGetUtilizationRates, h)
                 power = self._try(n.nvmlDeviceGetPowerUsage, h)
@@ -160,6 +181,9 @@ class NvmlBackend:
         n = self._nvml
         out: dict[int, list[GpuProcess]] = {}
         for i, h in enumerate(self._handles):
+            if h is None:
+                out[i] = []
+                continue
             seen: dict[int, tuple[str, int | None]] = {}
             for kind, fn in (
                 ("compute", n.nvmlDeviceGetComputeRunningProcesses),

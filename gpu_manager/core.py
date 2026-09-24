@@ -1,5 +1,5 @@
-"""Ядро менеджера: єдине місце, через яке йдуть обидві оболонки (веб і MCP), тож вони не можуть розійтися
-(рішення з обговорення, п. 7). Ядро не знає мов: відмови — ManagerError з кодом, попередження — код і параметри."""
+"""Ядро менеджера: єдине місце, через яке йдуть обидві оболонки (веб і MCP), тож вони не можуть розійтися.
+Ядро не знає мов: відмови — ManagerError з кодом, попередження — код і параметри."""
 
 from __future__ import annotations
 
@@ -46,6 +46,12 @@ class GpuManager:
         self._clock = clock
         self._info = backend.info()
         self._lock = threading.Lock()
+        # Зміна бронювання і її запис у журнал — одна дія: інакше одночасні дії (MCP іде в робочих потоках)
+        # потрапляли б у журнал не в тому порядку, у якому змінились бронювання.
+        self._change_lock = threading.Lock()
+        # Один tick за раз: move бере свіжий замір з потоку запиту, і замір фонового опитування, почату ще до зупинки
+        # моделі, записався б після свіжого — новий старт знову побачив би пам'ять зупиненої моделі.
+        self._tick_lock = threading.Lock()
         self._samples: dict[int, GpuSample] = {}
         self._procs: dict[int, list[GpuProcess]] = {}
         # Моделі менеджера на карті (фаза 3); підключає ModelRunner. Карта з моделлю — busy навіть до появи її
@@ -70,14 +76,22 @@ class GpuManager:
         """Спільний журнал дій: і карти, і моделі."""
         return self._journal
 
+    def close(self) -> None:
+        """Закриває базу історії при виході сервісу."""
+        self._history.close()
+
     def tick(self) -> None:
-        """Один крок опитування; викликається кожні sample_interval_s фоновою задачею."""
-        samples = self._backend.sample(self._clock())
-        procs = self._backend.processes()
-        with self._lock:
-            self._samples = {s.index: s for s in samples}
-            self._procs = procs
-        self._history.add(samples)
+        """Один крок опитування: фонова задача кожні sample_interval_s і move після зупинки моделі (свіжий замір).
+        Карта-заглушка (NVML не прочитав її при старті) перечитується, доки не прочитається."""
+        with self._tick_lock:
+            if any(not g.memory_total_mib for g in self._info):
+                self._info = self._backend.info()
+            samples = self._backend.sample(self._clock())
+            procs = self._backend.processes()
+            with self._lock:
+                self._samples = {s.index: s for s in samples}
+                self._procs = procs
+            self._history.add(samples)
 
     # ---- читання ---------------------------------------------------------------------------------
 
@@ -144,10 +158,11 @@ class GpuManager:
         напр. foreign_processes, коли на карті вже працюють процеси інших користувачів."""
         self._check_gpu(gpu)
         self._check_user(user)
-        new, previous = self._book.reserve(gpu, user, purpose, hours)
-        self._journal.record(
-            user, "reserve_update" if previous else "reserve", gpu=gpu, purpose=new.purpose, until=new.until
-        )
+        with self._change_lock:
+            new, previous = self._book.reserve(gpu, user, purpose, hours)
+            self._journal.record(
+                user, "reserve_update" if previous else "reserve", gpu=gpu, purpose=new.purpose, until=new.until
+            )
         view = self._view(gpu, self._clock())
         foreign = [p for p in view["processes"] if p["user"] != user]
         warnings = []
@@ -160,13 +175,14 @@ class GpuManager:
         """Знімає бронювання; повертає {released, previous, gpu}. Незаброньована карта — released=False."""
         self._check_gpu(gpu)
         self._check_user(user)
-        removed = self._book.release(gpu, user, force)
+        with self._change_lock:
+            removed = self._book.release(gpu, user, force)
+            if removed is not None and removed.user == user:
+                self._journal.record(user, "release", gpu=gpu)
+            elif removed is not None:
+                self._journal.record(user, "release_forced", gpu=gpu, owner=removed.user, purpose=removed.purpose)
         if removed is None:
             return {"released": False, "previous": None, "gpu": self.gpu(gpu)}
-        if removed.user == user:
-            self._journal.record(user, "release", gpu=gpu)
-        else:
-            self._journal.record(user, "release_forced", gpu=gpu, owner=removed.user, purpose=removed.purpose)
         return {"released": True, "previous": asdict(removed), "gpu": self.gpu(gpu)}
 
     # ---- перевірки -------------------------------------------------------------------------------

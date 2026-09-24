@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -26,15 +27,20 @@ from .runner_fakes import (
     MARKER,
     MIXED_NAME,
     MIXED_REPO,
+    NO_DEFAULT_CAP,
     NOT_LOCAL_REPO,
+    ODD_NAME,
+    ODD_REPO,
     PORT_FIRST,
     USED_HIGH_MIB,
     USED_MID_MIB,
+    flag_value,
     max_num_seqs_values,
     normalize_argv,
 )
 
 MAX_NUM_SEQS_DEFAULT = 32  # типовий vllm.max_num_seqs (§1)
+MEDIA_FLAG = "--allowed-local-media-path"  # §2.6: прапорець теки files.inbox_dir, лише коли тека існує
 
 pytestmark = [pytest.mark.component, pytest.mark.usefixtures("isolated_home")]
 
@@ -87,9 +93,9 @@ def test_vllm_bin_relative_resolved_from_config_dir(write_config, config_dir):
 
 
 @pytest.mark.req("SPEC-GPU-003 §1")
-@pytest.mark.parametrize(("field", "expected"), [("vllm_default_fraction", 1.0), ("vllm_start_timeout_s", 900)])
+@pytest.mark.parametrize(("field", "expected"), [("vllm_default_fraction", 0.95), ("vllm_start_timeout_s", 900)])
 def test_vllm_numeric_defaults(write_config, config_dir, field, expected):
-    """§1: типові default_fraction 1.0 і start_timeout_s 900."""
+    """§1: типові default_fraction 0.95 і start_timeout_s 900."""
     cfg = _load(write_config, config_dir)
     got = getattr(cfg, field)
     assert got == expected, f"Config.{field} without the setting: expected {expected!r}, got {got!r}"
@@ -101,6 +107,7 @@ def test_vllm_numeric_defaults(write_config, config_dir, field, expected):
     [
         ("vllm_default_fraction", "vllm.default_fraction", 0.8),
         ("vllm_default_fraction", "vllm.default_fraction", 0.05),  # нижня межа [0.05, 1] — ще дозволена
+        ("vllm_default_fraction", "vllm.default_fraction", 1.0),  # верхня межа [0.05, 1] — ще дозволена
         ("vllm_start_timeout_s", "vllm.start_timeout_s", 300),
     ],
 )
@@ -134,6 +141,19 @@ def test_vllm_max_num_seqs_below_one_refused(write_config, config_dir):
     except ConfigError:
         return
     pytest.fail("vllm.max_num_seqs=0: expected ConfigError (must be >= 1), the config loaded")
+
+
+@pytest.mark.req("SPEC-GPU-003 §1")
+@pytest.mark.parametrize("value", [0, -1], ids=["zero", "negative"])
+def test_vllm_start_timeout_not_positive_refused(write_config, config_dir, value):
+    """§1: vllm.start_timeout_s ≤ 0 → ConfigError (0 — межа, що вже недопустима)."""
+    from gpu_manager.config import ConfigError
+
+    try:
+        cfg = _load(write_config, config_dir, {"vllm.start_timeout_s": value})
+    except ConfigError:
+        return
+    pytest.fail(f"vllm.start_timeout_s={value}: expected ConfigError (must be > 0 s), loaded {cfg.vllm_start_timeout_s!r}")
 
 
 @pytest.mark.req("SPEC-GPU-003 §1")
@@ -204,20 +224,79 @@ def test_start_bad_fraction(runner_env, fraction):
     expect_manager_error("bad_fraction", runner_env.start, fraction=fraction)
 
 
-BAD_EXTRA_ARGS = {
+# §2.1: повний список прапорців, якими керує менеджер (у extra_args — bad_extra_args).
+FORBIDDEN_FLAGS = (
+    "--host", "--port", "--uds", "--served-model-name", "--gpu-memory-utilization", "--kv-cache-memory-bytes",
+    "--num-gpu-blocks-override", "--config", "--allowed-local-media-path", "--allowed-media-domains", "--api-key",
+    "--root-path", "--ssl-keyfile", "--ssl-certfile", "--ssl-ca-certs", "--middleware",
+)
+# §2.1 «також скорочений»: префікс, що серед прапорців vLLM веде лише до цього прапорця. Для --config скорочення
+# немає: у vLLM є --config-format, тож кожен коротший префікс --config неоднозначний і vLLM його сам відкине.
+# Найменшої довжини скорочення специфікація не задає (прогалина) — тут скорочення довгі й однозначні.
+FORBIDDEN_ABBREVIATIONS = {
+    "--host": "--hos",
+    "--port": "--por",
+    "--uds": "--ud",
+    "--served-model-name": "--served-model",
+    "--gpu-memory-utilization": "--gpu-memory-util",
+    "--kv-cache-memory-bytes": "--kv-cache-mem",
+    "--num-gpu-blocks-override": "--num-gpu-blocks",
+    "--allowed-local-media-path": "--allowed-local-media",
+    "--allowed-media-domains": "--allowed-media-dom",
+    "--api-key": "--api-ke",
+    "--root-path": "--root-pa",
+    "--ssl-keyfile": "--ssl-key",
+    "--ssl-certfile": "--ssl-certf",
+    "--ssl-ca-certs": "--ssl-ca-cert",
+    "--middleware": "--middlew",
+}
+FLAG_VALUE = "1"  # значення прапорця: відмова — за назвою прапорця, значення неважливе
+
+
+def _forbidden_flag_cases() -> dict[str, list[str]]:
+    """Кожен заборонений прапорець у кожній формі §2.1: повний, «=значення», «--прапорець.ключ», з «_» замість «-»
+    (якщо в назві є «-»), скорочений; плюс одна змішана форма (скорочення з «_» і «=значення»)."""
+    cases: dict[str, list[str]] = {}
+    for flag in FORBIDDEN_FLAGS:
+        stem = flag[2:]
+        cases[stem] = [flag, FLAG_VALUE]
+        cases[f"{stem}=value"] = [f"{flag}={FLAG_VALUE}"]
+        cases[f"{stem}.key"] = [f"{flag}.k", FLAG_VALUE]
+        if "-" in stem:
+            cases[f"{stem}-underscore"] = ["--" + stem.replace("-", "_"), FLAG_VALUE]
+        if flag in FORBIDDEN_ABBREVIATIONS:
+            cases[f"{stem}-abbrev"] = [FORBIDDEN_ABBREVIATIONS[flag], FLAG_VALUE]
+    cases["kv-cache-mem-abbrev-underscore=value"] = [f"--kv_cache_mem={FLAG_VALUE}"]
+    return cases
+
+
+BAD_EXTRA_ARGS: dict[str, Any] = {
     "not-strings": [42],
-    "host": ["--host", "0.0.0.0"],
-    "port": ["--port", "9000"],
-    "served-model-name": ["--served-model-name", "other"],
-    "gpu-memory-utilization": ["--gpu-memory-utilization", "0.5"],
+    "string-not-list": "--enforce-eager",  # рядок — ітерується посимвольно, але це не список рядків
+    # Перед забороненим — дозволений прапорець: перевіряється весь список, а не лише перший елемент.
+    **{f"flag:{case}": ["--enforce-eager", *args] for case, args in _forbidden_flag_cases().items()},
 }
 
 
 @pytest.mark.req("SPEC-GPU-003 §2.1")
 @pytest.mark.parametrize("case", sorted(BAD_EXTRA_ARGS))
 def test_start_bad_extra_args(runner_env, case):
-    """§2.1: extra_args не з рядків або з прапорцем, яким керує менеджер, → bad_extra_args."""
+    """§2.1: extra_args — не список рядків (зокрема рядок замість списку) або з прапорцем, яким керує менеджер,
+    у будь-якій формі (скорочений, з «_», «=значення», «--прапорець.ключ») → bad_extra_args."""
     expect_manager_error("bad_extra_args", runner_env.start, extra_args=BAD_EXTRA_ARGS[case])
+
+
+@pytest.mark.req("SPEC-GPU-003 §2.1")
+@pytest.mark.parametrize(
+    "extra", [["--enforce-eager"], ["--max-num-seqs", "8"]], ids=["enforce-eager", "max-num-seqs-8"]
+)
+def test_start_harmless_extra_args_accepted(runner_env, extra):
+    """§2.1: прапорець не зі списку заборонених приймається й доходить до argv кінцем extra_args (§2.6)."""
+    env = runner_env
+    env.start(extra_args=list(extra))
+    argv = env.argv(DEFAULT_NAME)
+    got = argv[-len(extra):]
+    assert got == extra, f"extra_args {extra!r}: expected a start with them at the end of argv, got argv {argv!r}"
 
 
 # --- §2.2 порт --------------------------------------------------------------------------------------------------------
@@ -321,6 +400,51 @@ def test_default_name_taken_gets_suffix(runner_env):
     assert got == expected, f"two starts of {REPO!r} without a name: expected names {expected!r}, got {got!r}"
 
 
+# repo → очікувана типова назва (§2.3): малими літерами, недозволені символи → «-», не довше 40, без «-», «.», «_»
+# на краях, порожня → model.
+DEFAULT_NAME_CASES = {
+    "edges-stripped": (ODD_REPO, ODD_NAME),
+    "disallowed-to-dash": ("acme/Tiny+LLM@v2", "tiny-llm-v2"),
+    "at-most-40": ("acme/" + "b" * 45, "b" * 40),
+    # 50 символів, «-» на 40-й позиції: обрізана до 40 назва закінчилася б «-», який теж знімається.
+    "cut-then-edge-stripped": ("acme/" + "a" * 39 + "-" + "b" * 10, "a" * 39),
+    "empty-is-model": ("acme/_._", "model"),
+}
+
+
+@pytest.mark.req("SPEC-GPU-003 §2.3")
+@pytest.mark.parametrize("case", sorted(DEFAULT_NAME_CASES))
+def test_default_name_rule(runner_env, case):
+    """§2.3: типова назва з останньої частини repo за правилом §2.3."""
+    repo, expected = DEFAULT_NAME_CASES[case]
+    env = runner_env
+    env.put_ready(repo)
+    env.start(repo=repo)
+    got = env.names()
+    assert got == [expected], f"default name for {repo!r}: expected [{expected!r}], got {got!r}"
+
+
+@pytest.mark.req("SPEC-GPU-003 §2.3")
+@pytest.mark.parametrize("name", ["x", "a" * 48, "v1.2_b-3"], ids=["one-char", "48-chars", "dot-underscore-dash"])
+def test_explicit_name_within_rule_accepted(runner_env, name):
+    """§2.3: назва за правилом [a-z0-9][a-z0-9._-]{0,47} приймається (48 символів — найдовша)."""
+    env = runner_env
+    env.start(name=name)
+    got = env.names()
+    assert got == [name], f"start(name={name!r}): expected servers() names [{name!r}], got {got!r}"
+
+
+@pytest.mark.req("SPEC-GPU-003 §2.3")
+@pytest.mark.parametrize(
+    "name",
+    ["a" * 49, "-x", ".x", "_x", "Coder", "a@b", "a/b"],
+    ids=["49-chars", "lead-dash", "lead-dot", "lead-underscore", "uppercase", "at-sign", "slash"],
+)
+def test_explicit_name_outside_rule_refused(runner_env, name):
+    """§2.3: назва поза правилом [a-z0-9][a-z0-9._-]{0,47} → bad_name."""
+    expect_manager_error("bad_name", runner_env.start, name=name)
+
+
 # --- §2.4 параметри: явні → профіль → типові ------------------------------------------------------------------------
 
 
@@ -341,6 +465,16 @@ def test_default_fraction_capped_by_default_fraction(make_runner_env):
     env.start()
     got = env.fractions(DEFAULT_NAME)
     assert got == [0.5], f"default fraction with vllm.default_fraction=0.5 on an empty card: expected [0.5], got {got!r}"
+
+
+@pytest.mark.req("SPEC-GPU-003 §1")
+@pytest.mark.req("SPEC-GPU-003 §2.4")
+def test_default_fraction_095_caps_empty_card(runner_env):
+    """§1, §2.4: без налаштування vllm.default_fraction частка порожньої карти — типові 0.95, а не 0.99 з пам'яті."""
+    env = runner_env
+    env.start()
+    got = env.fractions(DEFAULT_NAME)
+    assert got == [FRACTION_EMPTY], f"default fraction on an empty card without vllm.default_fraction: expected [{FRACTION_EMPTY}], got {got!r}"
 
 
 @pytest.mark.req("SPEC-GPU-003 §2.4")
@@ -378,8 +512,8 @@ def test_explicit_overrides_profile(runner_env):
 def test_profile_read_at_each_start(runner_env):
     """§2.4: профіль читається при кожному старті — записаний між стартами діє на наступний.
 
-    Перша модель зупиняється до другого старту: активна, вона займала б 0.99 частки цієї карти, і друга
-    отримала б лише 1 − 0.99 (§2.4, Σ часток активних моделей)."""
+    Перша модель зупиняється до другого старту: активна, вона займала б 0.95 частки цієї карти, і друга
+    отримала б лише 1 − 0.95 (§2.4, Σ часток активних моделей)."""
     env = runner_env
     env.start(name="before")
     env.runner.stop("before", "alice")
@@ -401,6 +535,25 @@ def test_explicit_fraction_within_free_accepted(runner_env):
     env.start(fraction=FRACTION_USED_MID)
     got = env.fractions(DEFAULT_NAME)
     assert got == [FRACTION_USED_MID], f"explicit fraction {FRACTION_USED_MID} within free memory: expected a start with it, got {got!r}"
+
+
+@pytest.mark.req("SPEC-GPU-003 §2.4")
+@pytest.mark.req("SPEC-GPU-003 §2.5")
+def test_explicit_fraction_above_default_fraction_accepted(runner_env):
+    """§2.4–2.5: vllm.default_fraction (типові 0.95) — стеля лише неявної частки. Явна 0.97 на порожній карті
+    46068 MiB не більша за вільну (45812/46068 = 0.9944 → 0.99) і стартує рівно з 0.97, без gpu_memory_low."""
+    from gpu_manager.messages import ManagerError
+
+    env = runner_env
+    try:
+        env.start(fraction=0.97)
+    except ManagerError as exc:
+        pytest.fail(
+            f"explicit fraction 0.97 on an empty card, default_fraction 0.95: expected a start, "
+            f"got ManagerError {getattr(exc, 'code', None)!r}: {exc}"
+        )
+    got = env.fractions(DEFAULT_NAME)
+    assert got == [0.97], f"explicit fraction 0.97 above default_fraction 0.95: expected a start with [0.97], got {got!r}"
 
 
 @pytest.mark.req("SPEC-GPU-003 §2.4")
@@ -430,10 +583,11 @@ def test_explicit_fraction_over_share_left_by_active_model_refused(runner_env):
 
 
 @pytest.mark.req("SPEC-GPU-003 §2.5")
-def test_implicit_fraction_below_minimum_refused(runner_env):
+def test_implicit_fraction_below_minimum_refused(make_runner_env):
     """§2.4–2.5: активна модель з явними 0.97 лишає карті 1 − 0.97 = 0.03; типовий старт другої моделі на цій
-    карті (неявна 0.03 < 0.05) → gpu_memory_low."""
-    env = runner_env
+    карті (неявна 0.03 < 0.05) → gpu_memory_low. vllm.default_fraction 1.0 не потрібна (стеля 0.95 обмежує лише
+    неявну частку, явна 0.97 ≤ вільної 0.99), але не заважає."""
+    env = make_runner_env(NO_DEFAULT_CAP)
     env.start(name="first", fraction=0.97)
     expect_manager_error("gpu_memory_low", env.start, name="second")
 
@@ -453,18 +607,54 @@ def test_implicit_fraction_above_minimum_started(runner_env):
 
 @pytest.mark.req("SPEC-GPU-003 §2")
 def test_unit_name(runner_env):
-    """§2: юніт моделі — gm-model-<name>."""
+    """§2: юніт моделі — gm-model-<name>.service (суфікс явний)."""
     env = runner_env
     env.start()
     units = [c.unit for c in env.launcher.calls]
-    assert units == [f"gm-model-{DEFAULT_NAME}"], f"launcher.start units: expected ['gm-model-{DEFAULT_NAME}'], got {units!r}"
+    expected = [f"gm-model-{DEFAULT_NAME}.service"]
+    assert units == expected, f"launcher.start units: expected {expected!r}, got {units!r}"
+
+
+@pytest.mark.req("SPEC-GPU-003 §2")
+def test_unit_names_of_x_and_x_service_differ(runner_env):
+    """§2: назви x і x.service — різні юніти: gm-model-x.service і gm-model-x.service.service."""
+    env = runner_env
+    env.start(name="x", gpu=GPU)
+    env.start(name="x.service", gpu=GPU_B)
+    got = sorted(c.unit for c in env.launcher.calls)
+    expected = ["gm-model-x.service", "gm-model-x.service.service"]
+    assert got == expected, f"launcher.start units for names 'x' and 'x.service': expected {expected!r}, got {got!r}"
+
+
+@pytest.mark.req("SPEC-GPU-003 §2")
+@pytest.mark.req("SPEC-GPU-003 §2.9")
+@pytest.mark.parametrize(("stopped", "kept"), [("x", "x.service"), ("x.service", "x")])
+def test_stop_one_of_x_and_x_service_keeps_other(runner_env, stopped, kept):
+    """§2, §2.9: stop однієї з моделей x / x.service не зачіпає юніта іншої: той лишається живим і в servers()."""
+    env = runner_env
+    env.start(name="x", gpu=GPU)
+    env.start(name="x.service", gpu=GPU_B)
+    env.runner.stop(stopped, "alice")
+    alive = sorted(env.launcher.alive)
+    got = (env.unit(kept) in env.launcher.alive, env.unit(stopped) in env.launcher.alive, kept in env.names())
+    assert got == (True, False, True), (
+        f"after stop({stopped!r}): expected (unit of {kept!r} alive, unit of {stopped!r} gone, {kept!r} listed) "
+        f"(True, False, True), got {got!r}; alive units {alive!r}, servers {env.names()!r}"
+    )
 
 
 @pytest.mark.req("SPEC-GPU-003 §2.6")
-def test_argv_exact(runner_env):
+@pytest.mark.parametrize("inbox_exists", [True, False], ids=["inbox-exists", "inbox-missing"])
+def test_argv_exact(make_runner_env, tmp_path, inbox_exists):
     """§2.6: argv дослівно — bin serve <знімок> --host --port --served-model-name --gpu-memory-utilization
-    --disable-uvicorn-access-log --max-model-len --max-num-seqs (типове 32), далі extra_args у своєму порядку."""
-    env = runner_env
+    --disable-uvicorn-access-log [--allowed-local-media-path <files.inbox_dir>, лише коли тека існує] --max-model-len
+    --max-num-seqs (типове 32), далі extra_args у своєму порядку. files.inbox_dir — тека в tmp_path: з типовим
+    /srv/gpu-inbox (SPEC-GPU-001 §2.4) argv залежав би від сервера, на якому йдуть тести."""
+    inbox = tmp_path.resolve() / "gpu-inbox"
+    if inbox_exists:
+        inbox.mkdir()
+    env = make_runner_env({"files.inbox_dir": str(inbox)})
+    media = [MEDIA_FLAG, str(inbox)] if inbox_exists else []
     extra = ["--enable-prefix-caching", "--seed", "7"]
     env.start(fraction=0.5, max_model_len=4096, extra_args=extra)
     expected = [
@@ -474,12 +664,30 @@ def test_argv_exact(runner_env):
         "--served-model-name", DEFAULT_NAME,
         "--gpu-memory-utilization", "0.5",
         "--disable-uvicorn-access-log",
+        *media,
         "--max-model-len", "4096",
         "--max-num-seqs", str(MAX_NUM_SEQS_DEFAULT),
         *extra,
     ]
     got = normalize_argv(env.argv(DEFAULT_NAME))
     assert got == normalize_argv(expected), f"vLLM argv:\n expected {normalize_argv(expected)!r}\n got      {got!r}"
+
+
+@pytest.mark.req("SPEC-GPU-003 §2.6")
+def test_argv_media_path_follows_inbox_created_later(make_runner_env, tmp_path):
+    """§2.6: «якщо тека існує» — на момент старту: перший старт без теки files.inbox_dir іде без прапорця,
+    старт після створення теки тим самим ModelRunner — з --allowed-local-media-path <тека>."""
+    inbox = tmp_path.resolve() / "gpu-inbox"
+    env = make_runner_env({"files.inbox_dir": str(inbox)})
+    env.start(name="before", gpu=GPU)
+    inbox.mkdir()
+    env.start(name="after", gpu=GPU_B)
+    got = (flag_value(env.argv("before"), MEDIA_FLAG), flag_value(env.argv("after"), MEDIA_FLAG))
+    expected = (None, str(inbox))
+    assert got == expected, (
+        f"{MEDIA_FLAG} value (start before the inbox existed, start after it was created): "
+        f"expected {expected!r}, got {got!r}"
+    )
 
 
 @pytest.mark.req("SPEC-GPU-003 §2.6")
@@ -515,8 +723,9 @@ def test_max_num_seqs_not_added_when_in_extra_args(runner_env, extra):
 
 @pytest.mark.req("SPEC-GPU-003 §2.6")
 def test_env_card_cache_offline(runner_env):
-    """§2.6: env — CUDA_VISIBLE_DEVICES=<gpu> (не успадкований від тестового процесу), HF_HOME, HF_HUB_OFFLINE=1,
-    CUDA_HOME."""
+    """§2.6: env — CUDA_DEVICE_ORDER=PCI_BUS_ID (номер карти в CUDA = номер у NVML), CUDA_VISIBLE_DEVICES=<uuid карти
+    з NVML> (uuid фальшивого бекенда; не успадкований від тестового процесу), HF_HOME, HF_HUB_OFFLINE=1,
+    VLLM_NO_USAGE_STATS=1, CUDA_HOME."""
     env = runner_env
     env.start()
     call_env = env.launcher.calls[-1].env
@@ -525,18 +734,33 @@ def test_env_card_cache_offline(runner_env):
         return None if value is None else str(Path(value).resolve())
 
     got = {
+        "CUDA_DEVICE_ORDER": call_env.get("CUDA_DEVICE_ORDER"),
+        "VLLM_NO_USAGE_STATS": call_env.get("VLLM_NO_USAGE_STATS"),
         "CUDA_VISIBLE_DEVICES": call_env.get("CUDA_VISIBLE_DEVICES"),
         "HF_HOME": _path(call_env.get("HF_HOME")),
         "HF_HUB_OFFLINE": call_env.get("HF_HUB_OFFLINE"),
         "CUDA_HOME": _path(call_env.get("CUDA_HOME")),
     }
     expected = {
-        "CUDA_VISIBLE_DEVICES": str(GPU),
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "VLLM_NO_USAGE_STATS": "1",
+        "CUDA_VISIBLE_DEVICES": env.card_uuid(GPU),
         "HF_HOME": _path(env.cfg.hf_home),
         "HF_HUB_OFFLINE": "1",
         "CUDA_HOME": _path(env.cfg.vllm_cuda_home),
     }
     assert got == expected, f"vLLM env: expected {expected!r}, got {got!r}"
+
+
+@pytest.mark.req("SPEC-GPU-003 §2.6")
+def test_env_card_number_when_uuid_empty(backend, make_runner_env):
+    """§2.6: uuid карти з NVML порожній → CUDA_VISIBLE_DEVICES = номер карти. uuid прибирається в бекенді ще до
+    збирання сервісу: менеджер читає info() при збиранні (SPEC-GPU-001 §10)."""
+    backend.infos[GPU] = replace(backend.infos[GPU], uuid="")
+    env = make_runner_env()
+    env.start()
+    got = env.launcher.calls[-1].env.get("CUDA_VISIBLE_DEVICES")
+    assert got == str(GPU), f"vLLM env CUDA_VISIBLE_DEVICES for gpu {GPU} with an empty uuid: expected {str(GPU)!r}, got {got!r}"
 
 
 @pytest.mark.req("SPEC-GPU-003 §2.6")

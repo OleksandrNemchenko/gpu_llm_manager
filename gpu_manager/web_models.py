@@ -1,9 +1,13 @@
-"""Веб-API моделей HuggingFace (фаза 2) для сторінки. Ті самі виклики ModelStore, що й у MCP; відмови — українською."""
+"""Веб-API моделей HuggingFace (фаза 2) для сторінки. Ті самі виклики ModelStore, що й у MCP; відмови — українською.
+
+Виклики HF і диска — у робочому потоці: у циклі подій вони зупиняли б увесь сервер (сторінку, MCP, потоки /v1),
+поки HF відповідає."""
 
 from __future__ import annotations
 
 from typing import Any
 
+import anyio.to_thread
 from starlette.requests import Request
 from starlette.routing import Route
 
@@ -18,27 +22,30 @@ def model_routes(models: ModelStore) -> list[Route]:
 
     async def search(request: Request) -> Any:
         q = request.query_params
-        return models.search(q.get("q", ""), int(q.get("limit", _SEARCH_DEFAULT)))
+        query, limit = q.get("q", ""), int(q.get("limit", _SEARCH_DEFAULT))
+        return await anyio.to_thread.run_sync(lambda: models.search(query, limit))
 
     async def info(request: Request) -> Any:
         q = request.query_params
         fraction = q.get("fraction")
-        return models.info(q["repo"], q.get("revision") or None, float(fraction) if fraction else None)
+        repo, revision, fr = q["repo"], q.get("revision") or None, float(fraction) if fraction else None
+        return await anyio.to_thread.run_sync(lambda: models.info(repo, revision, fr))
 
     async def local(request: Request) -> Any:
-        return {"local": models.local(), "downloads": models.downloads()}
+        return await anyio.to_thread.run_sync(lambda: {"local": models.local(), "downloads": models.downloads()})
 
     async def download(request: Request) -> Any:
         d = await json_body(request)
-        return models.download(str(d["repo"]), str(d["user"]), d.get("revision") or None)
+        repo, user, revision = str(d["repo"]), str(d["user"]), d.get("revision") or None
+        return await anyio.to_thread.run_sync(lambda: models.download(repo, user, revision))
 
     async def cancel(request: Request) -> Any:
         d = await json_body(request)
-        return models.cancel(str(d["repo"]), str(d["user"]))
+        return await anyio.to_thread.run_sync(models.cancel, str(d["repo"]), str(d["user"]))
 
     async def delete(request: Request) -> Any:
         d = await json_body(request)
-        return models.delete(str(d["repo"]), str(d["user"]))
+        return await anyio.to_thread.run_sync(models.delete, str(d["repo"]), str(d["user"]))
 
     return [
         Route("/api/models/search", guarded(search)),

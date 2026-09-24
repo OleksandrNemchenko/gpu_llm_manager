@@ -27,6 +27,33 @@ pytestmark = pytest.mark.component
 # Налаштування, на яких перевіряється формат обгортки (§2.2–2.3): різні розділи й типи значень.
 WRAPPED_PATHS = ["server.port", "users.allowed", "journal.keep_days"]
 
+# «Усі інтерфейси» різними записами (§2.5: «в будь-якому записі … тощо»). Перші чотири названі в §2.5;
+# "0.0.0" і "0x0" — інші записи, які inet_aton / getaddrinfo читають як 0.0.0.0, тож сокет на них
+# слухає всі інтерфейси.
+WILDCARD_HOSTS = ["0.0.0.0", "0", "0.0", "::", "0.0.0", "0x0"]
+WILDCARD_IDS = ["dotted-quad", "zero", "two-part", "any-ipv6", "three-part", "hex-zero"]
+# IPv6-адреси (§2.5): loopback, приватна ULA і IPv4-відображена — усе це IPv6.
+IPV6_HOSTS = ["::1", "fd7a::1", "::ffff:127.0.0.1"]
+IPV6_IDS = ["loopback", "ula", "ipv4-mapped"]
+# Списки рядків (§2.5), задані голим рядком.
+BARE_STRING_LISTS = {"server.hosts": "127.0.0.1", "server.extra_host_names": "gpu.lan", "users.allowed": "alice"}
+# Списки, у яких один елемент — не рядок.
+NON_STRING_ITEMS = {
+    "server.hosts": ["127.0.0.1", 5],
+    "server.extra_host_names": ["gpu.lan", None],
+    "users.allowed": ["alice", 7],
+}
+# Налаштування, що мають бути > 0 (§2.7), і поле Config кожного (§2, «Поля Config»).
+POSITIVE_SETTINGS = {
+    "gpu.sample_interval_s": "sample_interval_s",
+    "gpu.ring_keep_s": "ring_keep_s",
+    "gpu.history_db_interval_s": "history_db_interval_s",
+    "gpu.history_db_keep_days": "history_db_keep_days",
+    "gpu.busy_memory_mib": "busy_memory_mib",
+    "journal.keep_entries": "journal_keep_entries",
+    "journal.keep_days": "journal_keep_days",
+}
+
 
 @pytest.fixture(autouse=True)
 def _isolated_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -159,6 +186,27 @@ def test_config_relative_data_dir_resolved_from_config_dir(write_config, config_
 
 
 @pytest.mark.req("SPEC-GPU-001 §2.8")
+@pytest.mark.parametrize("data_dir", ["state/data", "../shared-data"], ids=["below-config", "beside-config"])
+def test_config_data_dir_absolute_when_config_path_relative(write_config, config_dir, tmp_path, monkeypatch, data_dir):
+    """§2.8: Config.data_dir — абсолютний шлях, навіть коли і конфіг, і paths.data_dir задані відносно.
+
+    Конфіг завантажується за відносним шляхом etc/config.json; після цього поточна тека змінюється —
+    абсолютний data_dir від неї не залежить.
+    """
+    path = write_config({"paths.data_dir": data_dir})
+    monkeypatch.chdir(tmp_path)
+    cfg = _load(path.relative_to(tmp_path))
+    monkeypatch.chdir(tmp_path / "isolated-cwd")
+    got = cfg.data_dir
+    expected = (config_dir / data_dir).resolve()
+    assert isinstance(got, Path) and got.is_absolute(), (
+        f"Config.data_dir for paths.data_dir={data_dir!r} loaded via a relative config path: "
+        f"expected an absolute Path, got {got!r}"
+    )
+    assert got.resolve() == expected, f"Config.data_dir: expected {expected}, got {got}"
+
+
+@pytest.mark.req("SPEC-GPU-001 §2.8")
 def test_config_absolute_data_dir_kept(write_config, tmp_path):
     """§2.8: абсолютний paths.data_dir використовується як є."""
     target = tmp_path / "abs-data"
@@ -240,10 +288,34 @@ def test_config_missing_required_setting_refused(write_config, dotted):
 
 
 @pytest.mark.req("SPEC-GPU-001 §2.5")
-@pytest.mark.parametrize("bad_host", ["0.0.0.0", "::", ""], ids=["any-ipv4", "any-ipv6", "empty"])
+@pytest.mark.parametrize("bad_host", WILDCARD_HOSTS + [""], ids=WILDCARD_IDS + ["empty"])
 def test_config_wildcard_or_empty_host_refused(write_config, bad_host):
-    """§2.5: server.hosts з 0.0.0.0, :: або порожнім рядком → ConfigError."""
+    """§2.5: server.hosts з «усі інтерфейси» в будь-якому записі або порожнім рядком → ConfigError.
+
+    Погана адреса стоїть другою: перевіряється кожен елемент списку, а не лише перший.
+    """
     _expect_config_error(write_config({"server.hosts": ["127.0.0.1", bad_host]}), f"server.hosts with {bad_host!r}")
+
+
+@pytest.mark.req("SPEC-GPU-001 §2.5")
+@pytest.mark.parametrize("bad_host", IPV6_HOSTS, ids=IPV6_IDS)
+def test_config_ipv6_host_refused(write_config, bad_host):
+    """§2.5: будь-яка IPv6-адреса в server.hosts (зокрема loopback ::1) → ConfigError."""
+    _expect_config_error(write_config({"server.hosts": ["127.0.0.1", bad_host]}), f"server.hosts with {bad_host!r}")
+
+
+@pytest.mark.req("SPEC-GPU-001 §2.5")
+@pytest.mark.parametrize(("dotted", "bare"), list(BARE_STRING_LISTS.items()), ids=list(BARE_STRING_LISTS))
+def test_config_list_setting_as_bare_string_refused(write_config, dotted, bare):
+    """§2.5: server.hosts, server.extra_host_names, users.allowed — списки; голий рядок → ConfigError."""
+    _expect_config_error(write_config({dotted: bare}), f"{dotted}={bare!r} (a string, not a list)")
+
+
+@pytest.mark.req("SPEC-GPU-001 §2.5")
+@pytest.mark.parametrize(("dotted", "value"), list(NON_STRING_ITEMS.items()), ids=list(NON_STRING_ITEMS))
+def test_config_list_setting_with_non_string_item_refused(write_config, dotted, value):
+    """§2.5: ці налаштування — списки саме рядків; елемент-число чи null → ConfigError."""
+    _expect_config_error(write_config({dotted: value}), f"{dotted}={value!r} (a non-string item)")
 
 
 @pytest.mark.req("SPEC-GPU-001 §2.5")
@@ -316,17 +388,17 @@ def test_config_single_port_model_range_accepted(write_config):
 
 
 @pytest.mark.req("SPEC-GPU-001 §2.7")
-@pytest.mark.parametrize(
-    ("dotted", "value"),
-    [
-        ("gpu.sample_interval_s", 0),
-        ("gpu.sample_interval_s", -1),
-        ("journal.keep_entries", 0),
-        ("journal.keep_entries", -5),
-        ("journal.keep_days", 0),
-        ("journal.keep_days", -1),
-    ],
-)
+@pytest.mark.parametrize("value", [0, -1], ids=["zero", "negative"])
+@pytest.mark.parametrize("dotted", list(POSITIVE_SETTINGS))
 def test_config_non_positive_limit_refused(write_config, dotted, value):
-    """§2.7: sample_interval_s, journal.keep_entries або journal.keep_days ≤ 0 → ConfigError."""
+    """§2.7: кожне з семи налаштувань ≤ 0 → ConfigError."""
     _expect_config_error(write_config({dotted: value}), f"{dotted}={value}")
+
+
+@pytest.mark.req("SPEC-GPU-001 §2.7")
+@pytest.mark.parametrize("dotted", list(POSITIVE_SETTINGS))
+def test_config_positive_limit_one_accepted(write_config, dotted):
+    """§2.7: межа — 0; найменше додатне ціле 1 допустиме й потрапляє у своє поле Config."""
+    field = POSITIVE_SETTINGS[dotted]
+    value = getattr(_load(write_config({dotted: 1})), field)
+    assert value == 1, f"{dotted}=1: expected Config.{field} == 1, got {value!r}"

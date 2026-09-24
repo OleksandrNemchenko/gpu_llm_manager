@@ -79,6 +79,11 @@ TINY_CONFIG: dict[str, Any] = {
 TINY_KV = 2 * 16 * 8 * 64 * 2  # §3.3: 32 768 байт на токен
 TINY_MAX_POSITION = 131072
 
+# Модель без ваг для vLLM: на HF лише GGUF, тож після select_files лишаються README і .gitattributes
+# (§3.1); weight_bytes = 0 (§3.2) → оцінка «не влазить» (§3) і відмова no_vllm_weights (§5.1.4a).
+NO_WEIGHTS_REPO = "acme/gguf-only-llm"
+NO_WEIGHTS_FILES: dict[str, int] = {".gitattributes": 1_519, "README.md": 5_120}
+
 CARD_KEYS = ("usable_gib", "fits", "max_context_tokens")  # поля запису per_card (§3)
 
 

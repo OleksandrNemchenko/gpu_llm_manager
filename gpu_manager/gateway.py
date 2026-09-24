@@ -8,11 +8,13 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
+import anyio
 import httpx
 from starlette.background import BackgroundTask
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
+from starlette.types import Receive
 
 from .messages import EN, ManagerError
 from .prompts import PromptStore
@@ -52,6 +54,35 @@ def resolve(runner: ModelRunner, prompts: PromptStore, body: dict[str, Any]) -> 
     return int(srv["port"]), out
 
 
+async def _send_unless_gone(client: httpx.AsyncClient, upstream: httpx.Request,
+                            receive: Receive) -> httpx.Response | None:
+    """Відповідь моделі (заголовки) або None, якщо клієнт пішов раніше. Без потоку vLLM шле заголовки лише після всієї
+    генерації, і розрив з'єднання клієнтом ніхто б не помітив: модель рахувала б до 600 с даремно. Скасований
+    запит закриває з'єднання з vLLM, і vLLM обриває генерацію. Помилка httpx — як є."""
+    result: list[httpx.Response | BaseException] = []
+
+    async def send() -> None:
+        try:
+            result.append(await client.send(upstream, stream=True))
+        except httpx.HTTPError as exc:
+            result.append(exc)
+        tg.cancel_scope.cancel()
+
+    async def watch() -> None:
+        while (await receive())["type"] != "http.disconnect":  # тіло вже прочитане: далі приходить лише розрив
+            pass
+        tg.cancel_scope.cancel()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(send)
+        tg.start_soon(watch)
+    if not result:
+        return None
+    if isinstance(result[0], BaseException):
+        raise result[0]
+    return result[0]
+
+
 def gateway_routes(runner: ModelRunner, prompts: PromptStore) -> tuple[list[Route], httpx.AsyncClient]:
     """Маршрути /v1 і клієнт до моделей: його закриває lifespan застосунку."""
     client = httpx.AsyncClient(timeout=_TIMEOUT, limits=_LIMITS)
@@ -73,9 +104,11 @@ def gateway_routes(runner: ModelRunner, prompts: PromptStore) -> tuple[list[Rout
             return _error(ManagerError("bad_request", detail=str(exc)))
         upstream = client.build_request("POST", f"http://127.0.0.1:{port}{request.url.path}", json=body)
         try:
-            r = await client.send(upstream, stream=True)
+            r = await _send_unless_gone(client, upstream, request.receive)
         except httpx.HTTPError as exc:
             return _error(ManagerError("bad_request", detail=f"model unreachable: {exc}"), 502)
+        if r is None:  # клієнт пішов; відповідь уже нікому не потрібна
+            return Response(status_code=499)
         headers = {k: v for k, v in r.headers.items() if k.lower() in _PASS_HEADERS}
 
         async def chunks() -> AsyncIterator[bytes]:

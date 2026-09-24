@@ -15,6 +15,8 @@ from .model_fakes import (
     CARD_MIB,
     GATED_OK_REPO,
     MISSING_REPO,
+    NO_WEIGHTS_FILES,
+    NO_WEIGHTS_REPO,
     REPO,
     TINY_KV,
     TINY_MAX_POSITION,
@@ -137,6 +139,17 @@ def test_info_fit_weights_gib(models_env):
     """§5.4.3, §3: weights_gib — ваги *.safetensors (рівно 0.5 GiB)."""
     got = _info(models_env)["fit"].get("weights_gib")
     assert got == 0.5, f"info() fit weights_gib: expected 0.5, got {got!r}"
+
+
+@pytest.mark.req("SPEC-GPU-002 §5.4.3")
+@pytest.mark.req("SPEC-GPU-002 §3.4")
+def test_info_no_weights_repo_fits_no_card(make_models_env):
+    """§5.4.3, §3: репозиторій лише з README і .gitattributes — у fit кожна карта fits false."""
+    env = make_models_env(card_sizes=[46068, 81559])
+    env.hub.add(NO_WEIGHTS_REPO, NO_WEIGHTS_FILES)
+    fit = _info(env, NO_WEIGHTS_REPO)["fit"]
+    got = {mib: card_view(fit, mib)["fits"] for mib in (46068, 81559)}
+    assert got == {46068: False, 81559: False}, f"info({NO_WEIGHTS_REPO!r}) fits per card: expected all False, got {got!r}"
 
 
 @pytest.mark.req("SPEC-GPU-002 §5.4.3")

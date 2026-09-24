@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -23,9 +24,12 @@ from .conftest import STRANGER, T0, USERS
 from .model_fakes import (
     GATED_OK_REPO,
     GATED_REPO,
+    GIB,
     HUGE_RESERVE_GIB,
     MIB,
     MISSING_REPO,
+    NO_WEIGHTS_FILES,
+    NO_WEIGHTS_REPO,
     PIB,
     REPO,
     REPO_B,
@@ -33,10 +37,13 @@ from .model_fakes import (
     TINY_FILES,
     TINY_TOTAL,
     TOKEN,
+    FakeSpawn,
+    ModelsEnv,
     append_log,
     expect_manager_error,
     gib_close,
     log_path,
+    models_settings,
     put_incomplete,
     put_snapshot,
     sha_of,
@@ -51,6 +58,11 @@ GRACE_S = 5  # §5.1.8: SIGKILL через 5 с після SIGTERM
 HUGE_REPO = "acme/huge-llm"
 # Модель «на 1 PiB» за API: без наявних файлів потрібне місце більше за будь-який диск (§5.1.5).
 HUGE_FILES = {"config.json": 700, "model-00001-of-00002.safetensors": PIB, "model-00002-of-00002.safetensors": MIB}
+LOG_MARKER = "=== gpu-manager download"  # §5.2: рядок-маркер, яким починається кожна спроба в лозі
+BIG_A = "acme/big-a-llm"  # дві моделі для перевірки диска з урахуванням інших активних (§5.1.5)
+BIG_B = "acme/big-b-llm"
+QUEUED_C = "acme/queued-c-llm"  # дві моделі в черзі для перевірки диска перед запуском з черги (§5.1.5): старша
+QUEUED_D = "acme/queued-d-llm"  # і молодша
 
 
 def _one_slot(make_models_env: Any) -> Any:
@@ -71,6 +83,35 @@ def _fail(env: Any, repo: str, lines: list[str], code: int = 1) -> None:
     append_log(log_path(env.data_dir, repo), lines)
     env.spawn.last(repo).finish(code)
     env.store.poll()
+
+
+def _add_big_pair(env: Any) -> int:
+    """Додає в hub BIG_A і BIG_B, ваги кожної — 3/4 справжнього вільного місця під кешем HF; повертає їх розмір.
+
+    Шва для вільного місця §10 не дає, тож розміри беруться від виміряного: одна модель влазить із запасом
+    1/4 вільного, дві разом перевищують вільне на 1/2 (models.min_free_disk_gib тестів — 0).
+    """
+    weights = shutil.disk_usage(env.hf_home).free * 3 // 4
+    for repo in (BIG_A, BIG_B):
+        env.hub.add(repo, {"config.json": 700, "model.safetensors": weights})
+    return weights
+
+
+def _restarted_with(env: Any, write_config: Any, overrides: dict[str, Any]) -> Any:
+    """Перезапуск сервісу над тими самими data_dir, кешем HF і hub, але з іншим конфігом і новою підробкою spawn."""
+    from gpu_manager.config import load_config
+
+    settings: dict[str, Any] = {"paths.data_dir": str(env.data_dir)}
+    settings.update(models_settings(env.hf_home))
+    settings.update(overrides)
+    cfg = load_config(write_config(settings))
+    return ModelsEnv(cfg, env.backend, env.clock, env.hub, FakeSpawn(), token=env.token_value, card_sizes=env.card_sizes)
+
+
+def _log_lines(env: Any, repo: str) -> list[str]:
+    """Рядки логу процесу завантаження repo (§5.2); немає файла — []."""
+    path = log_path(env.data_dir, repo)
+    return path.read_text(encoding="utf-8", errors="replace").splitlines() if path.is_file() else []
 
 
 # --- §5.1.1 користувач --------------------------------------------------------------------------------------------
@@ -205,6 +246,56 @@ def test_download_unknown_repo_refused(models_env):
     assert env.spawn.processes == [], f"after hf_not_found: expected no process, got {env.spawn.repos!r}"
 
 
+# --- §5.1.4a немає ваг ------------------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.req("SPEC-GPU-002 §5.1.4a")
+@pytest.mark.req("SPEC-GPU-002 §8")
+def test_download_no_weights_refused(models_env):
+    """§5.1.4a: серед вибраних файлів немає ваг (лише README і .gitattributes) → no_vllm_weights."""
+    env = models_env
+    env.hub.add(NO_WEIGHTS_REPO, NO_WEIGHTS_FILES)
+    expect_manager_error("no_vllm_weights", env.store.download, NO_WEIGHTS_REPO, "alice")
+
+
+@pytest.mark.req("SPEC-GPU-002 §5.1.4a")
+def test_download_no_weights_leaves_no_trace(models_env):
+    """§5.1.4a: відмова no_vllm_weights — без процесу, без запису черги й без журналу."""
+    env = models_env
+    env.hub.add(NO_WEIGHTS_REPO, NO_WEIGHTS_FILES)
+    expect_manager_error("no_vllm_weights", env.store.download, NO_WEIGHTS_REPO, "alice")
+    got = (env.spawn.repos, env.records(NO_WEIGHTS_REPO), env.journal_for(NO_WEIGHTS_REPO))
+    assert got == ([], [], []), f"after no_vllm_weights: expected (no processes, no records, no journal entries), got {got!r}"
+
+
+@pytest.mark.req("SPEC-GPU-002 §5.1.4a")
+@pytest.mark.req("SPEC-GPU-002 §5.1.3")
+def test_download_no_weights_checked_before_complete_snapshot(models_env):
+    """§5.1.4a: перевірка раніше за п. 3 — усі вибрані файли вже в знімку, але відповідь no_vllm_weights, не done."""
+    env = models_env
+    env.hub.add(NO_WEIGHTS_REPO, NO_WEIGHTS_FILES)
+    put_snapshot(env.hf_home, NO_WEIGHTS_REPO, NO_WEIGHTS_FILES)
+    expect_manager_error("no_vllm_weights", env.store.download, NO_WEIGHTS_REPO, "alice")
+
+
+@pytest.mark.req("SPEC-GPU-002 §5.1.4a")
+@pytest.mark.req("SPEC-GPU-002 §5.1.4")
+def test_download_no_weights_checked_before_gated(models_env):
+    """§5.1.4a: перевірка раніше за пп. 3–5, тож і за п. 4 — gated без доступу й без ваг → no_vllm_weights."""
+    env = models_env
+    env.hub.add(NO_WEIGHTS_REPO, NO_WEIGHTS_FILES, gated=True, access=False)
+    expect_manager_error("no_vllm_weights", env.store.download, NO_WEIGHTS_REPO, "alice")
+
+
+@pytest.mark.req("SPEC-GPU-002 §5.1.4a")
+@pytest.mark.req("SPEC-GPU-002 §5.1.5")
+def test_download_no_weights_checked_before_disk(make_models_env):
+    """§5.1.4a: перевірка раніше за п. 5 — запас диска недосяжний, але відповідь no_vllm_weights, не disk_full."""
+    env = make_models_env({"models.min_free_disk_gib": HUGE_RESERVE_GIB})
+    env.hub.add(NO_WEIGHTS_REPO, NO_WEIGHTS_FILES)
+    expect_manager_error("no_vllm_weights", env.store.download, NO_WEIGHTS_REPO, "alice")
+
+
 # --- §5.1.5 диск ------------------------------------------------------------------------------------------------------------------
 
 
@@ -246,6 +337,104 @@ def test_download_needed_space_excludes_present_files(models_env):
     env.store.download(HUGE_REPO, "alice")
     got = env.status(HUGE_REPO)
     assert got == "downloading", f"1 PiB already present, 1 MiB missing: expected 'downloading', got {got!r}"
+
+
+@pytest.mark.req("SPEC-GPU-002 §5.1.5")
+def test_download_disk_counts_remaining_of_other_active(models_env):
+    """§5.1.5: A (3/4 вільного) качається, на диску 0 байт; B того ж розміру: вільно − B − залишок A < 0 → disk_full."""
+    env = models_env
+    weights = _add_big_pair(env)
+    env.store.download(BIG_A, "alice")
+    assert env.status(BIG_A) == "downloading", f"precondition: {BIG_A!r} ({weights / 2**30:.1f} GiB) expected 'downloading', got {env.records(BIG_A)!r}"
+    expect_manager_error("disk_full", env.store.download, BIG_B, "bob")
+
+
+@pytest.mark.req("SPEC-GPU-002 §5.1.5")
+def test_download_disk_ignores_finished_downloads(models_env):
+    """§5.1.5: віднімається залишок лише АКТИВНИХ — після done моделі A модель B того ж розміру стає в роботу."""
+    env = models_env
+    _add_big_pair(env)
+    env.store.download(BIG_A, "alice")
+    env.spawn.last(BIG_A).finish(0)
+    env.store.poll()
+    env.clock.advance(10)
+    env.store.download(BIG_B, "bob")
+    got = env.status(BIG_B)
+    assert got == "downloading", f"{BIG_A!r} done, then {BIG_B!r} of 3/4 free space: expected 'downloading', got {got!r}"
+
+
+@pytest.mark.req("SPEC-GPU-002 §5.1.5")
+@pytest.mark.req("SPEC-GPU-002 §5.3")
+def test_download_disk_subtracts_remaining_not_total(models_env):
+    """§5.1.5: віднімається ЗАЛИШОК іншого активного — ваги A вже в знімку (§5.3), лишилось ≈ 700 байт, B стає в роботу."""
+    env = models_env
+    _add_big_pair(env)
+    env.store.download(BIG_A, "alice")
+    put_snapshot(env.hf_home, BIG_A, ["model.safetensors"])
+    env.store.poll()
+    env.clock.advance(10)
+    env.store.download(BIG_B, "bob")
+    got = env.status(BIG_B)
+    assert got == "downloading", f"{BIG_A!r} active with its weights present, {BIG_B!r} of 3/4 free space: expected 'downloading', got {got!r}"
+
+
+@pytest.mark.req("SPEC-GPU-002 §5.1.5")
+@pytest.mark.req("SPEC-GPU-002 §8")
+def test_queued_start_disk_check_fails_marks_failed_disk_full(make_models_env, write_config):
+    """§5.1.5, §8: перевірка диска й перед запуском з черги; не проходить → failed з error_code disk_full.
+
+    B стоїть у черзі (1 слот); сервіс перезапускається з запасом диска, більшим за будь-який диск.
+    """
+    env = _one_slot(make_models_env)
+    _queue(env, REPO, REPO_B)
+    restarted = _restarted_with(env, write_config, {"models.min_free_disk_gib": HUGE_RESERVE_GIB})
+    restarted.store.poll()
+    record = restarted.record(REPO_B)
+    got = (record.get("status"), record.get("error_code"))
+    assert got == ("failed", "disk_full"), f"queued {REPO_B!r} started without disk room: expected ('failed', 'disk_full'), got {record!r}"
+
+
+@pytest.mark.req("SPEC-GPU-002 §5.1.5")
+def test_queued_start_disk_check_fails_spawns_nothing(make_models_env, write_config):
+    """§5.1.5: перевірка перед запуском з черги не пройшла — процес не запускається."""
+    env = _one_slot(make_models_env)
+    _queue(env, REPO, REPO_B)
+    restarted = _restarted_with(env, write_config, {"models.min_free_disk_gib": HUGE_RESERVE_GIB})
+    restarted.store.poll()
+    assert restarted.spawn.processes == [], f"queue start without disk room: expected no process, got {restarted.spawn.repos!r}"
+
+
+@pytest.mark.req("SPEC-GPU-002 §5.1.5")
+def test_queued_start_disk_check_ignores_other_queued(make_models_env, write_config):
+    """§5.1.5: перед запуском з черги віднімається залишок лише тих, що вже качаються (downloading), а не інших queued.
+
+    Старша C і молодша D у черзі, 1 слот; після перезапуску downloading стає queued (§5.1.9), тож не качається нічого.
+    Шва для вільного місця §10 не дає, тож розміри — від виміряного вільного F під кешем HF: запас після перезапуску
+    M = ⌊F/2⌋ GiB, місце понад запас R = F − M, ваги C і D — по 2/3 R. Без D: F − C = M + R/3 ≥ M — C стартує;
+    якби рахувалась і D: F − C − D = M − R/3 < M — було б failed. До перезапуску (запас 0) обидві стають у чергу:
+    F − C − D = F − 4R/3 ≥ 0 за F ≥ 4 GiB.
+    """
+    env = _one_slot(make_models_env)
+    free = shutil.disk_usage(env.hf_home).free
+    assert free >= 4 * GIB, f"precondition: expected >= 4 GiB free under the HF cache for this sizing, got {free / GIB:.2f} GiB"
+    reserve_gib = free // GIB // 2
+    weights = (free - reserve_gib * GIB) * 2 // 3
+    for repo in (QUEUED_C, QUEUED_D):
+        env.hub.add(repo, {"config.json": 700, "model.safetensors": weights})
+    _queue(env, QUEUED_C, QUEUED_D)
+    before = (env.status(QUEUED_C), env.status(QUEUED_D))
+    assert before == ("downloading", "queued"), f"precondition: expected (C downloading, D queued) with 1 slot, got {before!r}"
+    restarted = _restarted_with(
+        env, write_config, {"models.max_parallel_downloads": 1, "models.min_free_disk_gib": reserve_gib}
+    )
+    restarted.store.poll()
+    record = restarted.record(QUEUED_C)
+    got = (record.get("status"), len(restarted.spawn.for_repo(QUEUED_C)))
+    assert got == ("downloading", 1), (
+        f"older queued {QUEUED_C!r} ({weights / GIB:.1f} GiB), reserve {reserve_gib} GiB of {free / GIB:.1f} GiB free, "
+        f"younger queued {QUEUED_D!r} of the same size not counted: expected ('downloading', 1 process), got {got!r}; "
+        f"record {record!r}"
+    )
 
 
 # --- §5.1.6 постановка в чергу ----------------------------------------------------------------------------------------------------
@@ -879,3 +1068,66 @@ def test_worker_log_per_model(models_env):
     paths = [log_path(env.data_dir, r) for r in (REPO, REPO_B)]
     missing = [str(p) for p in paths if not p.is_file()]
     assert not missing, f"per-model worker logs: expected {[str(p) for p in paths]}, missing {missing}"
+
+
+def _second_attempt(env: Any, first_lines: list[str], second_lines: list[str]) -> dict[str, Any]:
+    """Спроба 1 пише first_lines і падає; спроба 2 (новий download через 60 с) пише second_lines і падає.
+
+    Повертає найновіший запис downloads() для REPO (§5.1.11: найновіші першими).
+    """
+    env.store.download(REPO, "alice")
+    _fail(env, REPO, first_lines)
+    env.clock.advance(60)
+    env.store.download(REPO, "alice")
+    _fail(env, REPO, second_lines)
+    records = env.records(REPO)
+    assert records, f"after two attempts: expected a download record for {REPO!r}, got none"
+    return records[0]
+
+
+@pytest.mark.req("SPEC-GPU-002 §5.2")
+def test_worker_log_attempt_writes_marker(models_env):
+    """§5.2: спроба завантаження дописує в лог рядок, що починається з «=== gpu-manager download»."""
+    _started(models_env)
+    lines = _log_lines(models_env, REPO)
+    assert any(line.startswith(LOG_MARKER) for line in lines), f"worker log after one attempt: expected a line starting {LOG_MARKER!r}, got {lines!r}"
+
+
+@pytest.mark.req("SPEC-GPU-002 §5.2")
+def test_worker_log_marker_appended_per_attempt(models_env):
+    """§5.2: кожна спроба ДОПИСУЄ свій маркер — після двох спроб два маркери, вивід першої лишився між ними."""
+    env = models_env
+    first = "ERROR ValueError: first attempt output"
+    _second_attempt(env, [first], ["ERROR ValueError: second attempt output"])
+    lines = _log_lines(env, REPO)
+    markers = [i for i, line in enumerate(lines) if line.startswith(LOG_MARKER)]
+    between = len(markers) == 2 and first in lines[markers[0] + 1 : markers[1]]
+    assert between, f"worker log after two attempts: expected marker, {first!r}, marker in this order, got {lines!r}"
+
+
+@pytest.mark.req("SPEC-GPU-002 §5.2")
+@pytest.mark.req("SPEC-GPU-002 §5.1.7")
+def test_worker_log_no_space_before_last_marker_ignored(models_env):
+    """§5.2: причину шукають лише після останнього маркера — «No space left» минулої спроби не дає disk_full_during."""
+    env = models_env
+    record = _second_attempt(
+        env,
+        ["ERROR OSError: [Errno 28] No space left on device"],
+        ["ERROR HfHubHTTPError: 503 Server Error: Service Unavailable"],
+    )
+    got = (record.get("status"), record.get("error_code"))
+    assert got == ("failed", "download_failed"), f"old 'No space left', new HTTP 503: expected ('failed', 'download_failed'), got {record!r}"
+
+
+@pytest.mark.req("SPEC-GPU-002 §5.2")
+@pytest.mark.req("SPEC-GPU-002 §5.1.7")
+def test_worker_log_error_class_before_last_marker_ignored(models_env):
+    """§5.2: рядок ERROR минулої спроби не повторюється — нова без рядка ERROR дає download_failed, не hf_gated."""
+    env = models_env
+    record = _second_attempt(
+        env,
+        ["ERROR GatedRepoError: Access to model acme/tiny-llm is restricted"],
+        ["Fetching 9 files", "Killed"],
+    )
+    got = (record.get("status"), record.get("error_code"))
+    assert got == ("failed", "download_failed"), f"old GatedRepoError, new attempt killed: expected ('failed', 'download_failed'), got {record!r}"

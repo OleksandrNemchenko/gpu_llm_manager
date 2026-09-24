@@ -1,7 +1,7 @@
 """Тексти відмов і попереджень двома мовами.
 
 Навіщо: одна й та сама відмова йде і на вебсторінку (українською), і в термінал через MCP (англійською —
-правило 30-python для всього, що бачить машина). Ядро знає лише код і параметри; мову обирає оболонка."""
+усе, що бачить машина). Ядро знає лише код і параметри; мову обирає оболонка."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ _TEXTS: dict[str, tuple[str, str]] = {
         "GPU {gpu} is reserved by {owner}; releasing someone else's reservation needs force=true (journaled).",
         "GPU {gpu} зайняв {owner}. Чуже бронювання знімається лише примусово.",
     ),
-    "bad_hours": ("hours must be > 0, or omitted for no term", "Строк має бути більше 0 або не вказаний"),
+    "bad_hours": ("hours must be > 0 and at most {max}, or omitted for no term", "Строк — від 0 до {max} годин або не вказаний"),
     "bad_history": ("minutes and points must be > 0", "Період і кількість точок мають бути більше 0"),
     "bad_request": ("Bad request: {detail}", "Некоректний запит: {detail}"),
     "hf_unavailable": ("HuggingFace is unavailable: {detail}", "HuggingFace недоступний: {detail}"),
@@ -32,6 +32,8 @@ _TEXTS: dict[str, tuple[str, str]] = {
     "bad_fraction": ("fraction must be in (0, 1]", "Частка карти має бути від 0 до 1"),
     "disk_full": ("Not enough disk: need {need_gib} GiB, free {free_gib} GiB, reserve {reserve_gib} GiB",
                   "Мало місця: треба {need_gib} GiB, вільно {free_gib} GiB, запас {reserve_gib} GiB"),
+    "no_vllm_weights": ("{repo} has no safetensors/bin weights: vLLM cannot load it (e.g. a GGUF-only repo)",
+                        "У {repo} немає ваг safetensors/bin: vLLM її не запустить (напр. лише GGUF)"),
     "download_active": ("{repo} is downloading; cancel it first", "{repo} зараз завантажується; спершу скасуйте"),
     "download_not_active": ("{repo} is not downloading", "{repo} зараз не завантажується"),
     "model_not_local": ("{repo} is not on disk", "{repo} немає на диску"),
@@ -42,6 +44,9 @@ _TEXTS: dict[str, tuple[str, str]] = {
                        "GPU {gpu}: треба {need_gib} GiB, вільно {free_gib} GiB; зменште частку або візьміть іншу карту"),
     "empty_answer": ("The model returned no text (finish_reason: {reason}); raise max_tokens", "Модель не дала тексту ({reason}); збільште max_tokens"),
     "bad_pdf": ("Cannot read the PDF: {detail}", "Не вдалося прочитати PDF: {detail}"),
+    "bad_file_path": ("{path} is not a file inside the files folder (see files_inbox)",
+                      "{path} — не файл у теці файлів"),
+    "bad_file": ("Cannot use {path}: {detail}", "Не вдалося використати {path}: {detail}"),
     "stop_failed": ("Could not stop {name}; it stays under watch", "Не вдалося зупинити {name}; модель лишається під наглядом"),
     "server_not_found": ("No running model named {name}", "Немає запущеної моделі {name}"),
     "bad_name": ("Bad name {name!r}: a-z, 0-9, . _ -, up to 48 chars", "Погана назва «{name}»: a-z, 0-9, . _ -, до 48 символів"),
@@ -53,6 +58,8 @@ _TEXTS: dict[str, tuple[str, str]] = {
                           "Контекст не вміщується в KV-кеш: зменште max_model_len або збільште частку"),
     "hint_kv_len": ("Context does not fit the KV cache: start again with max_model_len={n} (or raise fraction)",
                     "Контекст не вміщується в KV-кеш: запустіть з max_model_len={n} (або збільште частку)"),
+    "hint_ctx_over_model": ("max_model_len is above the model's limit: start again with max_model_len={n}",
+                            "Контекст більший за межу моделі: запустіть з max_model_len={n}"),
     "hint_no_kv_memory": ("No memory left for the KV cache: raise fraction or use a smaller model",
                           "Не лишилося пам'яті на KV-кеш: збільште частку або візьміть меншу модель"),
     "hint_gpu_memory_taken": ("The GPU has less free memory than the fraction: lower fraction or pick another GPU",

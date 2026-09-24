@@ -1,11 +1,15 @@
 """§4 SPEC-GPU-001: бронювання й звільнення карт через HTTP API (§7.2.6–7.2.7), збереження стану.
 
+Межі hours (§4.4) перевіряються ще й напряму в ядрі — GpuManager.reserve (відмова — ManagerError, §10).
+
 Час у записі бронювання — unix-секунди фальшивого годинника: since = now, until = now + hours·3600
 (§4.3). Час старту годинника — T0.
 """
 
 from __future__ import annotations
 
+import json
+import math
 from typing import Any
 
 import pytest
@@ -23,6 +27,7 @@ from .conftest import (
     reservations,
     reserve,
 )
+from .model_fakes import expect_manager_error
 
 pytestmark = pytest.mark.e2e
 
@@ -171,6 +176,143 @@ def test_reserve_non_positive_hours_refused(env, hours):
         refusal(reserve(c, 1, "alice", hours=hours), "bad_hours")
         reservation = card(c, 1)["reservation"]
     assert reservation is None, f"after bad_hours for hours={hours!r}: expected no reservation, got {reservation!r}"
+
+
+# --- §4.4 hours не скінченне або більше року ----------------------------------------------------------------
+
+YEAR_HOURS = 8760  # §4.4: «більше 8760 (рік)» → bad_hours; саме 8760 допустиме
+# hours сирим текстом JSON (§7.2.6: число або рядок-число). 1e309 — коректне число JSON за межею double:
+# розбір дає inf, а json.dumps такого тексту не породить, тому тіло збирається вручну.
+BAD_HOURS_JSON = {
+    "str-nan": '"nan"',
+    "str-inf": '"inf"',
+    "str-minus-inf": '"-inf"',
+    "number-1e309": "1e309",
+    "over-year": "9000",
+    "just-over-year": "8760.5",
+}
+# Ті самі випадки для ядра (Python-значення) плюс ≤ 0.
+BAD_HOURS_CORE = {
+    "nan": math.nan,
+    "inf": math.inf,
+    "minus-inf": -math.inf,
+    "zero": 0,
+    "negative": -1,
+    "just-over-year": 8760.5,
+    "over-year": 9000,
+}
+
+
+def _reserve_raw_hours(client: Any, gpu: int, user: str, hours_json: str, purpose: str = "x") -> Any:
+    """POST /api/reserve {gpu, user, purpose, hours}, де hours вставлено в тіло як сирий текст JSON."""
+    head = json.dumps({"gpu": gpu, "user": user, "purpose": purpose})
+    body = head[:-1] + f', "hours": {hours_json}}}'
+    return client.post("/api/reserve", content=body.encode("utf-8"), headers={"Content-Type": "application/json"})
+
+
+def _reject_constant(name: str) -> Any:
+    """parse_constant для json.loads: NaN / Infinity / -Infinity — не JSON (RFC 8259), браузер їх не розбере."""
+    raise ValueError(f"non-standard JSON constant {name}")
+
+
+@pytest.mark.req("SPEC-GPU-001 §4.4")
+@pytest.mark.req("SPEC-GPU-001 §9.5")
+@pytest.mark.parametrize("hours_json", list(BAD_HOURS_JSON.values()), ids=list(BAD_HOURS_JSON))
+def test_reserve_out_of_range_hours_refused(env, hours_json):
+    """§4.4: hours не скінченне або > 8760 → bad_hours; бронювання не створюється."""
+    with env.client() as c:
+        refusal(_reserve_raw_hours(c, 1, "alice", hours_json), "bad_hours")
+        reservation = card(c, 1)["reservation"]
+    assert reservation is None, f"after bad_hours for hours={hours_json}: expected no reservation, got {reservation!r}"
+
+
+@pytest.mark.req("SPEC-GPU-001 §4.4")
+@pytest.mark.parametrize("hours_json", list(BAD_HOURS_JSON.values()), ids=list(BAD_HOURS_JSON))
+def test_reserve_out_of_range_hours_keeps_existing_reservation(env, hours_json):
+    """§4.4: bad_hours при повторному бронюванні тим самим — бронювання не змінюється (ні purpose, ні until)."""
+    with env.client() as c:
+        ok_json(reserve(c, 1, "alice", purpose="a", hours=1), "reserve gpu 1 for 1 h")
+        env.clock.advance(60)
+        refusal(_reserve_raw_hours(c, 1, "alice", hours_json, purpose="b"), "bad_hours")
+        got = _projection(card(c, 1)["reservation"], ("user", "purpose", "since", "until"))
+    expected = {"user": "alice", "purpose": "a", "since": T0, "until": T0 + HOUR_S}
+    assert got == expected, f"after bad_hours for hours={hours_json}: expected reservation unchanged {expected!r}, got {got!r}"
+
+
+@pytest.mark.req("SPEC-GPU-001 §4.4")
+@pytest.mark.req("SPEC-GPU-001 §7.2.3")
+@pytest.mark.parametrize("hours_json", list(BAD_HOURS_JSON.values()), ids=list(BAD_HOURS_JSON))
+def test_reserve_out_of_range_hours_overview_still_serves(env, hours_json):
+    """§4.4, §7.2.3: після відмови bad_hours GET /api/overview — HTTP 200 зі стандартним JSON (без NaN/Infinity)."""
+    with env.client() as c:
+        _reserve_raw_hours(c, 1, "alice", hours_json)
+        resp = c.get("/api/overview")
+    assert resp.status_code == 200, (
+        f"GET /api/overview after hours={hours_json}: expected HTTP 200, got {resp.status_code}: {resp.text[:300]}"
+    )
+    try:
+        json.loads(resp.text, parse_constant=_reject_constant)
+    except ValueError as exc:
+        pytest.fail(f"GET /api/overview after hours={hours_json}: expected standard JSON, parsing failed ({exc})")
+
+
+@pytest.mark.req("SPEC-GPU-001 §4.4")
+def test_reserve_hours_one_year_accepted(env):
+    """§4.4: hours = 8760 (рівно рік) — не «більше 8760»: бронювання з until = now + 8760·3600."""
+    with env.client() as c:
+        ok_json(reserve(c, 1, "alice", purpose="year", hours=YEAR_HOURS), "reserve gpu 1 for 8760 h")
+        until = card(c, 1)["reservation"]["until"]
+    expected = T0 + YEAR_HOURS * HOUR_S
+    assert until == expected, f"hours=8760: expected until {expected}, got {until!r}"
+
+
+def _core_reserve(manager: Any) -> Any:
+    """Метод ядра GpuManager.reserve; аргументи — іменовані, назвами полів §4 (gpu, user, purpose, hours).
+
+    SPEC-GPU-001 §10 не називає методу бронювання в ядрі й не дає його сигнатури — прогалина; назву дав
+    координатор, імена аргументів узято з §4 / §7.2.6 / §8.4. Усі виклики — лише через цю функцію.
+    """
+    method = getattr(manager, "reserve", None)
+    if not callable(method):
+        pytest.fail(
+            "GpuManager.reserve is missing: SPEC-GPU-001 §10 names no core reservation method; these tests assume "
+            "reserve(gpu=, user=, purpose=, hours=) with the field names of §4"
+        )
+    return method
+
+
+@pytest.mark.req("SPEC-GPU-001 §4.4")
+@pytest.mark.req("SPEC-GPU-001 §10")
+@pytest.mark.parametrize("hours", list(BAD_HOURS_CORE.values()), ids=list(BAD_HOURS_CORE))
+def test_core_reserve_bad_hours_refused(env, hours):
+    """§4.4, §10: GpuManager.reserve з hours не скінченним, ≤ 0 або > 8760 — ManagerError з code bad_hours."""
+    expect_manager_error("bad_hours", _core_reserve(env.manager), gpu=1, user="alice", purpose="x", hours=hours)
+
+
+@pytest.mark.req("SPEC-GPU-001 §4.4")
+@pytest.mark.req("SPEC-GPU-001 §10")
+@pytest.mark.parametrize("hours", list(BAD_HOURS_CORE.values()), ids=list(BAD_HOURS_CORE))
+def test_core_reserve_bad_hours_keeps_reservation(env, hours):
+    """§4.4: відмова bad_hours ядра не змінює наявного бронювання того самого користувача."""
+    core_reserve = _core_reserve(env.manager)
+    core_reserve(gpu=1, user="alice", purpose="a", hours=1)
+    env.clock.advance(60)
+    expect_manager_error("bad_hours", core_reserve, gpu=1, user="alice", purpose="b", hours=hours)
+    with env.client() as c:
+        got = _projection(card(c, 1)["reservation"], ("user", "purpose", "since", "until"))
+    expected = {"user": "alice", "purpose": "a", "since": T0, "until": T0 + HOUR_S}
+    assert got == expected, f"after core bad_hours for hours={hours!r}: expected reservation unchanged {expected!r}, got {got!r}"
+
+
+@pytest.mark.req("SPEC-GPU-001 §4.4")
+@pytest.mark.req("SPEC-GPU-001 §10")
+def test_core_reserve_hours_one_year_accepted(env):
+    """§4.4: GpuManager.reserve з hours = 8760 бронює карту до now + 8760·3600."""
+    _core_reserve(env.manager)(gpu=1, user="alice", purpose="year", hours=YEAR_HOURS)
+    with env.client() as c:
+        until = (card(c, 1)["reservation"] or {}).get("until")
+    expected = T0 + YEAR_HOURS * HOUR_S
+    assert until == expected, f"core reserve with hours=8760: expected until {expected}, got {until!r}"
 
 
 # --- §4.5 повторне бронювання ------------------------------------------------------------------------------
@@ -335,6 +477,15 @@ def test_purpose_stored_trimmed(env):
         ok_json(reserve(c, 0, "alice", purpose="   train llm   "), "reserve with padded purpose")
         purpose = card(c, 0)["reservation"]["purpose"]
     assert purpose == "train llm", f"purpose: expected 'train llm', got {purpose!r}"
+
+
+@pytest.mark.req("SPEC-GPU-001 §4.11")
+def test_purpose_null_over_http_is_empty(env):
+    """§4.11: purpose: null у HTTP — порожня мета "", а не текст "None"."""
+    with env.client() as c:
+        ok_json(reserve(c, 0, "alice", purpose=None), "reserve with purpose null")
+        purpose = card(c, 0)["reservation"]["purpose"]
+    assert purpose == "", f"purpose null over HTTP: expected '' (empty purpose), got {purpose!r}"
 
 
 # --- §4.12–4.13 стан на диску -----------------------------------------------------------------------------------------

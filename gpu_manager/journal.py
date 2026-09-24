@@ -16,6 +16,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from .store import fsync_dir
+
 _SECONDS_PER_DAY = 86400
 
 
@@ -76,3 +78,5 @@ class Journal:
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
             raise
+        with contextlib.suppress(OSError):  # файл уже новий; невдалий fsync теки не робить запис невдалим
+            fsync_dir(self._path.parent)

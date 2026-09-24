@@ -2,13 +2,18 @@
 
 Статус читається з GET /api/overview (§7.2.3). Телеметрію й процеси фальшивий бекенд віддає вже
 під час старту: lifespan build_app сам робить tick() (§10).
+
+Там само — §10: карта-заглушка (NVML її не прочитав) повертається з повними даними після tick(), що перечитує info().
 """
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
-from .conftest import BUSY_MIB, card, gpu_proc, ok_json, refusal, reserve
+from .conftest import BUSY_MIB, MEM_TOTAL_MIB, card, gpu_proc, ok_json, refusal, reserve
+from .runner_fakes import DEFAULT_NAME, GPU
 
 pytestmark = pytest.mark.e2e
 
@@ -47,6 +52,30 @@ def test_status_memory_threshold(env, backend, used_mib, expected):
         status = card(c, 2)["status"]
     assert status == expected, (
         f"gpu 2 with {used_mib} MiB used (threshold {BUSY_MIB} MiB): expected {expected!r}, got {status!r}"
+    )
+
+
+@pytest.mark.req("SPEC-GPU-001 §3.4")
+@pytest.mark.req("SPEC-GPU-003 §2.12")
+@pytest.mark.usefixtures("isolated_home")
+@pytest.mark.parametrize("model_state", ["starting", "running"])
+def test_status_manager_model_makes_card_busy(runner_env, model_state):
+    """§3.4: модель менеджера на карті (models непорожній) робить її busy — без процесів і з 0 MiB пам'яті.
+
+    Модель запускає справжній ModelRunner над підробками швів SPEC-GPU-003 §2; фальшивий бекенд процесів
+    vLLM не показує й пам'яті не займає, тож єдина причина busy — поле models. starting — випадок, коли
+    vLLM ще не встиг ні з'явитися серед процесів, ні зайняти пам'ять.
+    """
+    env = runner_env
+    env.start()
+    if model_state == "running":
+        env.ensure_running(DEFAULT_NAME)
+    with env.client() as c:
+        item = card(c, GPU)
+    assert item.get("models") and item.get("status") == "busy", (
+        f"gpu {GPU} with a {model_state} manager model, no processes, 0 MiB used: expected non-empty models and "
+        f"status 'busy', got status {item.get('status')!r}, models {item.get('models')!r}, "
+        f"processes {item.get('processes')!r}, memory_used_mib {item.get('memory_used_mib')!r}"
     )
 
 
@@ -187,3 +216,78 @@ def test_card_users_are_sorted_process_owners_and_reserver(env, backend):
         ok_json(reserve(c, 1, "carol", purpose="shared"), "reserve gpu 1 by carol")
         users = card(c, 1)["users"]
     assert users == ["bob", "carol", "dave"], f"gpu 1 users: expected ['bob', 'carol', 'dave'], got {users!r}"
+
+
+# --- §10: заглушка карти й повторне читання info() ---------------------------------------------------------------
+
+PLACEHOLDER_GPU = 1
+
+
+def _placeholder(index: int) -> Any:
+    """Заглушка карти, яку NVML не прочитав (§10): той самий index, name "unknown", memory_total_mib 0, порожні рядки
+    й None замість решти."""
+    from gpu_manager.gpu import GpuInfo
+
+    return GpuInfo(
+        index=index,
+        name="unknown",
+        uuid="",
+        pci_bus_id="",
+        memory_total_mib=0,
+        power_limit_w=None,
+        ecc_enabled=None,
+        compute_capability="",
+        temp_slowdown_c=None,
+    )
+
+
+def _build_with_placeholder(make_env: Any, backend: Any) -> tuple[Any, Any]:
+    """Збирає сервіс, поки бекенд віддає карту PLACEHOLDER_GPU заглушкою (і її замір — з error, §10).
+
+    Повертає (env, справжній GpuInfo карти) — щоб тест потім «повернув» карту в NVML через _recover.
+    """
+    real = backend.infos[PLACEHOLDER_GPU]
+    backend.infos[PLACEHOLDER_GPU] = _placeholder(PLACEHOLDER_GPU)
+    backend.set_error(PLACEHOLDER_GPU)
+    return make_env(), real
+
+
+def _recover(backend: Any, real: Any) -> None:
+    """NVML знову читає карту: info() віддає справжній GpuInfo, замір без помилки."""
+    backend.infos[PLACEHOLDER_GPU] = real
+    backend.set_reading(PLACEHOLDER_GPU, error=None)
+
+
+@pytest.mark.req("SPEC-GPU-001 §10")
+def test_tick_rereads_info_restores_placeholder_card(make_env, backend):
+    """§10: при збиранні менеджера карта 1 — заглушка; далі NVML читає її знову → після tick() /api/overview показує
+    її справжні name і memory_total_mib. Lifespan клієнта робить ще один tick() — теж tick() за §10."""
+    env, real = _build_with_placeholder(make_env, backend)
+    _recover(backend, real)
+    env.manager.tick()
+    with env.client() as c:
+        item = card(c, PLACEHOLDER_GPU)
+    got = (item.get("name"), item.get("memory_total_mib"))
+    expected = (real.name, MEM_TOTAL_MIB)
+    assert got == expected, (
+        f"gpu {PLACEHOLDER_GPU} placeholder at build, readable again before tick(): expected (name, memory_total_mib) "
+        f"{expected!r} MiB, got {got!r}"
+    )
+
+
+@pytest.mark.req("SPEC-GPU-001 §10")
+def test_tick_keeps_rereading_info_while_placeholder(make_env, backend):
+    """§10: поки є заглушка, info() перечитує КОЖЕН tick(), а не лише перший: карта лишалась заглушкою на першому
+    tick() і стала читатися перед другим → після другого /api/overview показує її справжні name і memory_total_mib."""
+    env, real = _build_with_placeholder(make_env, backend)
+    env.manager.tick()
+    _recover(backend, real)
+    env.manager.tick()
+    with env.client() as c:
+        item = card(c, PLACEHOLDER_GPU)
+    got = (item.get("name"), item.get("memory_total_mib"))
+    expected = (real.name, MEM_TOTAL_MIB)
+    assert got == expected, (
+        f"gpu {PLACEHOLDER_GPU} still a placeholder on the 1st tick(), readable before the 2nd: expected "
+        f"(name, memory_total_mib) {expected!r} MiB, got {got!r}"
+    )

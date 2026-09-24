@@ -21,7 +21,8 @@ from .credentials import hf_token
 from .gateway import gateway_routes
 from .gpu import GpuBackend
 from .history import History
-from .hub import HubClient
+from .hub import HubClient, limit_hf_requests
+from .inbox import Inbox
 from .journal import Journal
 from .mcp_tools import build_mcp
 from .models import ModelStore
@@ -53,8 +54,10 @@ def build_models(cfg: Config, manager: GpuManager) -> ModelStore:
     def token() -> str | None:  # читається щоразу: токен міняють у secrets.json без перезапуску
         return hf_token(cfg.secrets_path)
 
+    limit_hf_requests()
+
     return ModelStore(cfg, HubClient(token), manager.store, manager.journal_log,
-                      lambda: [g["memory_total_mib"] for g in manager.overview()["gpus"]], token)
+                      lambda: [g["memory_total_mib"] for g in manager.overview()["gpus"] if g["memory_total_mib"]], token)
 
 
 def build_runner(cfg: Config, manager: GpuManager, models: ModelStore) -> ModelRunner:
@@ -71,15 +74,6 @@ async def _poll_forever(poll: Callable[[], None], what: str, interval: float) ->
             await anyio.to_thread.run_sync(poll)
         except Exception:
             log.exception("%s poll failed; retrying", what)  # одна невдача не зупиняє опитування
-        await anyio.sleep(interval)
-
-
-async def _sample_forever(manager: GpuManager, interval: float) -> None:
-    while True:
-        try:
-            await anyio.to_thread.run_sync(manager.tick)
-        except Exception:
-            log.exception("GPU sampling failed; retrying next tick")  # одна невдача не зупиняє опитування
         await anyio.sleep(interval)
 
 
@@ -114,8 +108,9 @@ def render_guide(cfg: Config) -> str:
 def build_app(cfg: Config, manager: GpuManager, models: ModelStore | None = None,
               runner: ModelRunner | None = None, prompts: PromptStore | None = None) -> Starlette:
     """ASGI-застосунок. models — фаза 2, runner — фаза 3; None — без них (так збирають тести фази 1)."""
+    inbox = Inbox(cfg.inbox_dir, cfg.users, _public_host(cfg).rsplit(":", 1)[0])
     mcp = build_mcp(manager, cfg.display_timezone, guide=lambda: render_guide(cfg), models=models, runner=runner,
-                    prompts=prompts)
+                    prompts=prompts, inbox=inbox)
     mcp_app = mcp.streamable_http_app(
         stateless_http=True,  # без MCP-сесій: перезапуск менеджера клієнти не помічають
         json_response=True,
@@ -132,7 +127,7 @@ def build_app(cfg: Config, manager: GpuManager, models: ModelStore | None = None
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         await anyio.to_thread.run_sync(manager.tick)  # перше відкриття сторінки вже має дані
         async with mcp.session_manager.run(), anyio.create_task_group() as tg:
-            tg.start_soon(_sample_forever, manager, cfg.sample_interval_s)
+            tg.start_soon(_poll_forever, manager.tick, "GPU sampling", cfg.sample_interval_s)
             if models is not None:
                 tg.start_soon(_poll_forever, models.poll, "download queue", cfg.sample_interval_s)
             if runner is not None:

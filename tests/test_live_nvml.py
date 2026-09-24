@@ -37,6 +37,8 @@ IDLE_USED_MIB_MAX = 100
 MIN_PLAUSIBLE_C = 0.0
 # Верхня межа, коли NVML не віддав temp_slowdown_c; у специфікації порогу немає — TBD.
 FALLBACK_MAX_C = 100.0
+# Карта, яку тест «відриває від шини» підміною nvmlDeviceGetHandleByIndex (§10); номер дав координатор.
+LOST_INDEX = 1
 
 
 @pytest.fixture(scope="module")
@@ -123,6 +125,78 @@ def test_live_nvml_idle_cards_use_little_memory(snapshot):
     used = {s.index: s.memory_used_mib for s in snapshot["samples"] if s.index in idle}
     heavy = {i: mib for i, mib in used.items() if not (isinstance(mib, (int, float)) and mib < IDLE_USED_MIB_MAX)}
     assert not heavy, f"idle cards (no processes): expected < {IDLE_USED_MIB_MAX} MiB used, got {heavy!r} MiB"
+
+
+@pytest.fixture
+def lost_card(monkeypatch: pytest.MonkeyPatch, smi_cards: dict[int, str]) -> dict[str, Any]:
+    """Знімок NvmlBackend(), для якого карта LOST_INDEX «відпала від шини» (§10).
+
+    pynvml.nvmlDeviceGetHandleByIndex підмінено: для LOST_INDEX кидає NVMLError_GpuIsLost, для решти карт
+    викликає справжню функцію. Підміна діє до кінця тесту — і на конструктор, і на info / sample / processes.
+    Тест лише читає NVML, як і решта файлу.
+    """
+    import pynvml
+
+    from gpu_manager.gpu import NvmlBackend
+
+    if LOST_INDEX not in smi_cards:
+        pytest.skip(f"needs a card with index {LOST_INDEX} to lose; nvidia-smi shows indexes {sorted(smi_cards)}")
+    original = pynvml.nvmlDeviceGetHandleByIndex
+
+    def get_handle(index: Any, *args: Any, **kwargs: Any) -> Any:
+        if int(index) == LOST_INDEX:
+            raise pynvml.NVMLError_GpuIsLost()
+        return original(index, *args, **kwargs)
+
+    monkeypatch.setattr(pynvml, "nvmlDeviceGetHandleByIndex", get_handle)
+    try:
+        backend = NvmlBackend()
+        info = backend.info()
+        samples = backend.sample(time.time())
+        procs = backend.processes()
+    except pynvml.NVMLError as exc:
+        pytest.fail(f"NvmlBackend with gpu {LOST_INDEX} lost: expected the backend to keep working, it raised {exc!r}")
+    return {"info": info, "samples": samples, "procs": procs}
+
+
+@pytest.mark.req("SPEC-GPU-001 §10")
+def test_live_nvml_lost_card_kept_in_info(lost_card):
+    """§10: карта, для якої NVML кидає NVMLError, лишається в info() з тим самим index, name "unknown", 0 MiB."""
+    entries = [g for g in lost_card["info"] if g.index == LOST_INDEX]
+    got = [(g.name, g.memory_total_mib) for g in entries]
+    assert got == [("unknown", 0)], (
+        f"NvmlBackend.info() for lost gpu {LOST_INDEX}: expected one entry (name 'unknown', memory_total_mib 0), "
+        f"got {got!r}"
+    )
+
+
+@pytest.mark.req("SPEC-GPU-001 §10")
+def test_live_nvml_lost_card_sample_has_error(lost_card):
+    """§10: замір втраченої карти в sample() є і має непорожнє error."""
+    entries = [s for s in lost_card["samples"] if s.index == LOST_INDEX]
+    errors = [s.error for s in entries]
+    assert entries and all(errors), (
+        f"NvmlBackend.sample() for lost gpu {LOST_INDEX}: expected a sample with a non-empty error, got errors {errors!r}"
+    )
+
+
+@pytest.mark.req("SPEC-GPU-001 §10")
+def test_live_nvml_lost_card_processes_empty(lost_card):
+    """§10: у processes() втрачена карта — порожній список."""
+    procs = lost_card["procs"]
+    got = procs.get(LOST_INDEX, "<missing>") if isinstance(procs, dict) else procs
+    assert got == [], f"NvmlBackend.processes()[{LOST_INDEX}] for the lost gpu: expected [], got {got!r}"
+
+
+@pytest.mark.req("SPEC-GPU-001 §10")
+def test_live_nvml_lost_card_others_still_read(lost_card, smi_cards):
+    """§10: втрачена карта не зупиняє бекенд — кожна інша карта в sample() є і без помилки."""
+    expected = sorted(i for i in smi_cards if i != LOST_INDEX)
+    got = sorted(s.index for s in lost_card["samples"] if s.index != LOST_INDEX and s.error is None)
+    errors = {s.index: s.error for s in lost_card["samples"] if s.index != LOST_INDEX and s.error is not None}
+    assert got == expected, (
+        f"with gpu {LOST_INDEX} lost: expected error-free samples of gpus {expected}, got {got}, errors {errors!r}"
+    )
 
 
 @pytest.mark.req("SPEC-GPU-001 §10")

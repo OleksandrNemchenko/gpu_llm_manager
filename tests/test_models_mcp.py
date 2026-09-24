@@ -19,6 +19,8 @@ from .model_fakes import (
     HUGE_RESERVE_GIB,
     MIB,
     MISSING_REPO,
+    NO_WEIGHTS_FILES,
+    NO_WEIGHTS_REPO,
     REPO,
     REPO_B,
     REPO_C,
@@ -301,6 +303,11 @@ def _search_hub_down(env: Any, server: Any) -> str:
     return mcp_refusal(server, "hf_search", {"query": "llama"})
 
 
+def _download_no_weights(env: Any, server: Any) -> str:
+    env.hub.add(NO_WEIGHTS_REPO, NO_WEIGHTS_FILES)
+    return mcp_refusal(server, "model_download", {"repo": NO_WEIGHTS_REPO, "user": "alice"})
+
+
 # case → (код, перевизначення конфігу, дія над (env, server), що повертає str(ToolError)).
 MCP_REFUSALS: dict[str, tuple[str, dict[str, Any], Any]] = {
     "download-unknown-user": (
@@ -320,6 +327,7 @@ MCP_REFUSALS: dict[str, tuple[str, dict[str, Any], Any]] = {
         "download_not_active", {}, lambda env, s: mcp_refusal(s, "model_download_cancel", {"repo": REPO, "user": "alice"}),
     ),
     "delete-not-local": ("model_not_local", {}, lambda env, s: mcp_refusal(s, "model_delete", {"repo": REPO, "user": "alice"})),
+    "download-no-weights": ("no_vllm_weights", {}, _download_no_weights),
 }
 
 

@@ -1,8 +1,8 @@
 ---
 id: SPEC-GPU-001
-status: draft
+status: accepted
 owner: gpu-manager
-verified: 2026-09-23 21:06
+verified: 2026-09-24 12:06
 ---
 
 # Специфікація фази 1: карти, бронювання, вебсторінка, MCP
@@ -26,16 +26,17 @@ verified: 2026-09-23 21:06
 | 2 | Налаштування — об'єкт рівно з двома ключами: `value` і `comment`; `comment` — непорожній рядок (число чи інший тип → `ConfigError`). |
 | 3 | Налаштування без обгортки (голе значення), зайвий ключ або порожній `comment` → `ConfigError`, у тексті — шлях налаштування (напр. `server.port`). |
 | 4 | Обов'язкові налаштування: `server.hosts` (список адрес), `server.port`, `server.display_timezone` (IANA, напр. `Europe/Kyiv`), `users.allowed` (список логінів), `gpu.sample_interval_s`, `gpu.ring_keep_s`, `gpu.history_db_interval_s`, `gpu.history_db_keep_days`, `gpu.busy_memory_mib`, `vllm.port_range` (`[від, до]` включно), `journal.keep_entries`, `journal.keep_days`, `paths.data_dir`. Необов'язкові: `server.extra_host_names` (список), `files.inbox_dir` (шлях, типово `/srv/gpu-inbox`). Відсутнє обов'язкове → `ConfigError`. |
-| 5 | `server.hosts` з `0.0.0.0`, `::` або порожнім рядком → `ConfigError`. Порожній `server.hosts` або `users.allowed` → `ConfigError`. |
+| 5 | `server.hosts` з адресою «усі інтерфейси» в будь-якому записі (`0.0.0.0`, `0`, `0.0`, `::` тощо), з IPv6-адресою або порожнім рядком → `ConfigError`. Порожній `server.hosts` або `users.allowed` → `ConfigError`. `server.hosts`, `server.extra_host_names`, `users.allowed` — списки рядків, інакше `ConfigError`. |
 | 6 | `server.port` поза 1024..65535 → `ConfigError`. `vllm.port_range` поза 1024..65535, з `від > до`, або такий, що містить `server.port` → `ConfigError`. |
-| 7 | `gpu.sample_interval_s ≤ 0`, `journal.keep_entries ≤ 0` або `journal.keep_days ≤ 0` → `ConfigError`. |
-| 8 | Відносний `paths.data_dir` рахується від теки, де лежить конфіг. |
+| 7 | Будь-яке з `gpu.sample_interval_s`, `gpu.ring_keep_s`, `gpu.history_db_interval_s`, `gpu.history_db_keep_days`, `gpu.busy_memory_mib`, `journal.keep_entries`, `journal.keep_days` ≤ 0 → `ConfigError`. |
+| 8 | Відносний `paths.data_dir` рахується від теки, де лежить конфіг; `Config.data_dir` — абсолютний шлях. |
 | 9 | Дозволені імена хоста (`host_names`) = `server.hosts` + `server.extra_host_names`, без повторів, у цьому порядку. |
 
 Python: `gpu_manager.config.load_config(path: Path) -> Config`, `gpu_manager.config.ConfigError`.
 Поля `Config`: `hosts`, `port`, `host_names`, `display_timezone` (`ZoneInfo`), `users`, `sample_interval_s`,
 `ring_keep_s`, `history_db_interval_s`, `history_db_keep_days`, `busy_memory_mib`, `model_ports`
-(кортеж `(від, до)`), `journal_keep_entries`, `journal_keep_days`, `data_dir` (`Path`).
+(кортеж `(від, до)`), `journal_keep_entries`, `journal_keep_days`, `data_dir` (`Path`), `inbox_dir` (`Path`, абсолютний;
+відносний `files.inbox_dir` — від теки конфігу).
 
 ## 3. Стан карти
 
@@ -44,7 +45,7 @@ Python: `gpu_manager.config.load_config(path: Path) -> Config`, `gpu_manager.con
 | 1 | `reserved` | є бронювання, строк не минув (або строку немає) |
 | 2 | `reserved_expired` | є бронювання, момент `until` настав (`now ≥ until`) |
 | 3 | `unknown` | бронювання немає, а телеметрії карти немає або вона з помилкою |
-| 4 | `busy` | бронювання немає, але є процеси на карті або зайнята пам'ять ≥ `busy_memory_mib` |
+| 4 | `busy` | бронювання немає, але є процеси на карті, модель менеджера на ній (`models` непорожній) або зайнята пам'ять ≥ `busy_memory_mib` |
 | 5 | `free` | усе інше |
 
 Пріоритет — у порядку рядків: бронювання важливіше за процеси.
@@ -58,15 +59,15 @@ Python: `gpu_manager.config.load_config(path: Path) -> Config`, `gpu_manager.con
 | 1 | `user` має бути з `users.allowed`, інакше відмова `unknown_user`. |
 | 2 | `gpu` — ціле 0..N-1 (N — кількість карт); інше (зокрема `true`/`false`) → `unknown_gpu`. |
 | 3 | Бронювання вільної карти: запис `{gpu, user, purpose, since=now, until}`; `until = now + hours·3600` або `null`, якщо `hours` не задано. |
-| 4 | `hours ≤ 0` → `bad_hours`. |
+| 4 | `hours` не скінченне (`NaN`, `±∞`), `≤ 0` або більше 8760 (рік) → `bad_hours`; бронювання не змінюється. |
 | 5 | Повторне бронювання тим самим користувачем: оновлює `purpose` і `until`, **`since` не змінюється**. |
 | 6 | Бронювання чужої заброньованої карти → `reserved_by_other`; бронювання не змінюється. |
 | 7 | Якщо на карті вже є процеси, власник яких ≠ `user`, бронювання відбувається, але відповідь містить попередження `foreign_processes`. |
 | 8 | Звільнення власного бронювання — успіх, `released: true`. |
 | 9 | Звільнення незаброньованої карти — не помилка: `released: false`. |
 | 10 | Звільнення чужого бронювання без `force` → `release_needs_force`, бронювання лишається. З `force=true` — знімається. |
-| 11 | `purpose` зберігається з обрізаними пробілами на краях. |
-| 12 | Бронювання переживають перезапуск сервісу (зберігаються в `data_dir/state.json`). |
+| 11 | `purpose` зберігається з обрізаними пробілами на краях; `null` у HTTP — порожня мета. |
+| 12 | Бронювання переживають перезапуск сервісу і вимкнення живлення: `data_dir/state.json` пишеться атомарно (тимчасовий файл, fsync, rename, fsync теки). |
 | 13 | Пошкоджений `state.json` (не JSON або не об'єкт) — сервіс **не стартує** (`StateError`), а не починає з порожнього стану. |
 
 ## 5. Журнал дій
@@ -80,7 +81,8 @@ Python: `gpu_manager.config.load_config(path: Path) -> Config`, `gpu_manager.con
 | 3 | звільнення свого | `release` | — |
 | 4 | звільнення чужого з force | `release_forced` | `owner` (чиє було), `purpose` |
 
-Відмови й `released: false` у журнал не пишуться. Журнал повертається від найновішого запису. Файл — `data_dir/journal.jsonl`;
+Відмови й `released: false` у журнал не пишуться. Записи йдуть у тому ж порядку, що й зміни бронювань
+(одночасні дії різних людей не міняються в журналі місцями). Журнал повертається від найновішого запису. Файл — `data_dir/journal.jsonl`;
 рядок, обірваний аварійною зупинкою, не має ховати ні попередні записи, ні наступні.
 
 Зберігання обмежене двома межами з конфігу: лишаються лише останні `journal.keep_entries` записів і лише
@@ -131,7 +133,7 @@ Python: `gpu_manager.config.load_config(path: Path) -> Config`, `gpu_manager.con
 (`[{pid, user, name, cmdline, used_mib, kind}]`), `reservation` (`{gpu, user, purpose, since, until, expired}`
 або `null`).
 
-`public_host` — перша адреса з `server.hosts`, що не loopback (уся `127.0.0.0/8`, `::1`, `localhost` — RFC 1122), з портом (`"203.0.113.7:1200"`).
+`public_host` — перша адреса з `server.hosts`, що не loopback (уся `127.0.0.0/8` і `localhost` — RFC 1122), з портом (`"203.0.113.7:1200"`).
 
 Відмова — HTTP 400, тіло `{"code": "<код>", "error": "<текст українською>"}`. Некоректний JSON або
 відсутнє обов'язкове поле — код `bad_request`.
@@ -141,8 +143,9 @@ Python: `gpu_manager.config.load_config(path: Path) -> Config`, `gpu_manager.con
 Українською, мінімум тексту, зручна на телефоні, тема — за налаштуванням системи. Картка кожної карти:
 температура, завантаження, потужність, пам'ять, процеси (власник, пам'ять; командний рядок — на дотик),
 бронювання. Зайнята карта — вся картка іншого кольору. Вибір «хто я» зберігається в cookie. Внизу —
-згорнуті блоки «Як користуватися» (коротка інструкція) і «Підключити агента (MCP)» (команди для Claude Code
-і Codex з уже підставленими адресою та логіном).
+згорнуті блоки «Як користуватися» (коротка інструкція) і «Підключити агента (MCP)» (команди для Claude Code,
+Google Antigravity, OpenAI Codex і OpenCode з уже підставленими адресою та логіном). Форми не скидають вибору
+людини під час щосекундного оновлення.
 Оновлення — щосекунди, поки вкладка видима.
 
 ## 8. MCP
@@ -175,7 +178,7 @@ since, until, expired} | null, processes: [{pid, user, name, mib}], error?}`.
 | 2 | `unknown_user` | логін не з `users.allowed` |
 | 3 | `reserved_by_other` | бронювання чужої заброньованої карти |
 | 4 | `release_needs_force` | звільнення чужого без `force` |
-| 5 | `bad_hours` | `hours ≤ 0` |
+| 5 | `bad_hours` | `hours` не скінченне, `≤ 0` або > 8760 |
 | 6 | `bad_history` | `minutes ≤ 0` або `points ≤ 0` |
 | 7 | `bad_request` | некоректне тіло HTTP-запиту |
 | 8 | `foreign_processes` | попередження: на заброньованій карті процеси інших власників |
@@ -188,10 +191,15 @@ since, until, expired} | null, processes: [{pid, user, name, mib}], error?}`.
   ecc_enabled, compute_capability, temp_slowdown_c)`, `GpuSample(index, ts, temperature_c, util_pct, power_w,
   memory_used_mib, error=None)`, `GpuProcess(pid, user, name, cmdline, used_mib, kind)`; протокол `GpuBackend`
   з методами `info() -> list[GpuInfo]`, `sample(ts) -> list[GpuSample]`, `processes() -> dict[int, list[GpuProcess]]`.
-  Справжній бекенд — `gpu_manager.gpu.NvmlBackend()` (без аргументів; читає всі карти через NVML).
+  Справжній бекенд — `gpu_manager.gpu.NvmlBackend()` (без аргументів; читає всі карти через NVML). Карта, для якої
+  NVML кидає `pynvml.NVMLError` (напр. `pynvml.nvmlDeviceGetHandleByIndex` для карти, що відпала від шини), не зупиняє
+  сервіс: вона лишається в `info()` з тим самим `index`, `name` = `"unknown"`, `memory_total_mib` = 0, порожніми
+  рядками й `None` замість решти; її замір у `sample()` — з `error`; у `processes()` — порожній список.
 - `gpu_manager.app.build_manager(cfg, backend, clock=time.time) -> GpuManager` — `clock` повертає поточний
   unix-час; усі строки й історія рахуються від нього.
-- `GpuManager.tick()` — один крок опитування (читає `backend.sample` і `backend.processes`).
+- `GpuManager.tick()` — один крок опитування (читає `backend.sample` і `backend.processes`). Одночасні виклики
+  йдуть по черзі: замір, почату раніше, не перезаписує пізнішого. Поки серед карт є заглушка (`memory_total_mib` = 0),
+  кожен `tick()` спершу перечитує `backend.info()`: карта, яку NVML знову читає, повертається з повними даними.
 - `gpu_manager.app.build_app(cfg, manager) -> Starlette` — ASGI-застосунок; під час старту (lifespan) сам
   робить `tick()` і далі опитує кожні `sample_interval_s`.
 - `gpu_manager.mcp_tools.build_mcp(manager, tz, guide=None) -> MCPServer`; `guide` — функція без аргументів, що

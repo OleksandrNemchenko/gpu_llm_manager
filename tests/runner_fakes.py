@@ -21,7 +21,7 @@ import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
@@ -35,31 +35,41 @@ from .model_fakes import REPO, ModelsEnv, journal_entries, model_dir, put_snapsh
 GPU = 2  # основна карта тестів (карти 2 і 3 — ті, що в репозиторії відведені під перевірки)
 GPU_B = 3  # друга карта
 PORT_FIRST = MODEL_PORTS[0]  # 8000 — найменший порт vllm.port_range тестового конфігу (§2.2)
-UNIT_PREFIX = "gm-model-"  # юніт моделі — gm-model-<name> (§2)
+UNIT_PREFIX = "gm-model-"  # юніт моделі — gm-model-<name>.service (§2)
+UNIT_SUFFIX = ".service"  # суфікс юніта явний: назви x і x.service — різні юніти (§2)
 MARKER = "=== gpu-manager start"  # рядок-маркер кожного старту в лозі моделі (§2.6)
 START_TIMEOUT_S = 600  # vllm.start_timeout_s тестового конфігу; ≠ типових 900 (§1), щоб було видно, звідки значення
 DEFAULT_NAME = "tiny-llm"  # типова назва для REPO "acme/tiny-llm" (§2.3)
 MIXED_REPO = "Acme/Qwen3-Coder-8B"  # repo з великими літерами — для правила «малими літерами» (§2.3)
 MIXED_NAME = "qwen3-coder-8b"
+ODD_REPO = "acme/_Tiny_LLM_"  # repo з «_» на краях — правило «без -, ., _ на краях» (§2.3)
+ODD_NAME = "tiny_llm"  # малими літерами, «_» з обох країв знято; «_» усередині дозволений
 NOT_LOCAL_REPO = "acme/not-downloaded"  # моделі немає в кеші HF → model_not_local (§2.1)
-READY_REPOS = (REPO, MIXED_REPO)  # моделі, що лежать у кеші тестів готовими (state ready, SPEC-GPU-002 §5.4.1)
+READY_REPOS = (REPO, MIXED_REPO, ODD_REPO)  # моделі, що лежать у кеші тестів готовими (state ready, SPEC-GPU-002 §5.4.1)
 READY_FILES = ("config.json", "model.safetensors", "tokenizer.json")
 PROFILE_FIELDS = {"fraction", "max_model_len", "extra_args", "gpu", "updated", "attempts"}  # запис профілю (§2.7)
 
-# Частки карти 46068 MiB за формулою §2.4: (total − used − 256 MiB)/total, донизу до 0.01.
-FRACTION_EMPTY = 0.99  # used 0:      45812/46068 = 0.9944 → 0.99
+# Вільна частка карти 46068 MiB за §2.4: min((total − used − 256 MiB)/total, 1 − Σ), донизу до 0.01. Неявна частка —
+# ще й не більше vllm.default_fraction (типові 0.95, §1): ця стеля обрізає лише майже порожню карту, нижче 0.95 частку
+# задає пам'ять. Явну частку обмежує лише вільна.
+NO_DEFAULT_CAP = {"vllm.default_fraction": 1.0}  # верхня межа §1: частку обрізають лише пам'ять і Σ (тести не про типову частку)
+FRACTION_EMPTY = 0.95  # неявна, used 0: min(45812/46068 = 0.9944, default_fraction 0.95) → 0.95
+FRACTION_EMPTY_NO_CAP = 0.99  # used 0 при NO_DEFAULT_CAP: 45812/46068 = 0.9944 → 0.99
 USED_MID_MIB = 10_000
 FRACTION_USED_MID = 0.77  # used 10000:  35812/46068 = 0.7774 → 0.77 (звичайне округлення дало б 0.78)
 USED_HIGH_MIB = 40_000
 FRACTION_USED_HIGH = 0.12  # used 40000:  5812/46068 = 0.1262 → 0.12
 # §2.5 при used 10000: дозволено total·f ≤ free − 256 = 35812 MiB, тобто f ≤ 0.7774; 0.78·46068 = 35933 > 35812.
 FRACTION_OVER_MID = 0.78
-LADDER_BELOW_DEFAULT = (0.95, 0.92, 0.9)  # щаблі §2.8 нижче типової частки 0.99 порожньої карти
+LADDER_BELOW_DEFAULT = (0.92, 0.9)  # щаблі §2.8 (1.0, 0.95, 0.92, 0.9) нижче типової частки 0.95 порожньої карти
+LADDER_BELOW_NO_CAP = (0.95, 0.92, 0.9)  # щаблі §2.8 нижче частки 0.99 порожньої карти при NO_DEFAULT_CAP
 
 # --- Рядки логу vLLM (§2.8) -------------------------------------------------------------------------------
 # Справжні тексти помилок vLLM / PyTorch з префіксом рівня ERROR у форматі логу vLLM: що саме §2.8 вважає
-# «рядком помилки», специфікація не каже (прогалина), тож кожен рядок-тригер тут однозначно помилковий.
-# Кожен рядок містить рівно один тригер §2.8 — інакше «перший збіг» був би неоднозначним.
+# «рядком помилки», специфікація не каже (прогалина), тож кожен рядок-тригер тут однозначно помилковий. Виняток —
+# pydantic-форма «контекст більший за межу моделі»: її тригер навмисно не в рядку помилки (§2.8 шукає його всюди).
+# Кожен рядок (багаторядкова pydantic-форма — уся група) містить рівно один тригер §2.8 — інакше «перший збіг»
+# був би неоднозначним.
 
 _ERR = "ERROR 09-23 21:00:00 [core.py:708] "
 _INFO = "INFO 09-23 21:00:00 [api_server.py:1024] "
@@ -81,6 +91,38 @@ def line_mamba(seqs: int, n: int) -> str:
         "requires one Mamba cache block, so CUDA graph capture cannot proceed. "
         f"Please lower max_num_seqs to at most {n} or increase gpu_memory_utilization."
     )
+
+
+def line_ctx_over_model(user_len: int, n: int) -> str:
+    """Помилка vLLM «greater than the derived max_model_len (<ключ>=N» (§2.8): заданий контекст більший за межу
+    моделі. Рядок дослівний, без префікса рівня: рядок помилки — завдяки «ValueError»."""
+    return (
+        f"ValueError: User-specified max_model_len ({user_len}) is greater than the derived max_model_len "
+        f"(max_position_embeddings={n} or model_max_length=None in model's config.json)."
+    )
+
+
+def lines_ctx_over_model_pydantic(user_len: int, n: int) -> list[str]:
+    """Та сама помилка «greater than the derived max_model_len (<ключ>=N» у форматі vLLM 0.30 (§2.8): pydantic-виняток
+    на кілька рядків. Тригер — у рядку «  Value error, …», де немає ні ERROR, ні …Error, ні …Exception, ні Traceback,
+    ні fatal, тобто це не рядок помилки: правило має знайти тригер у будь-якому рядку логу останнього старту.
+    За user_len = 8192, n = 4096 — дослівний вивід vLLM 0.30."""
+    return [
+        "pydantic_core._pydantic_core.ValidationError: 1 validation error for ModelConfig",
+        f"  Value error, User-specified max_model_len ({user_len}) is greater than the derived max_model_len "
+        f"(max_position_embeddings={n} or model_max_length=None in model's config.json). To allow overriding this "
+        "maximum, set the env var VLLM_ALLOW_LONG_MAX_MODEL_LEN=1. [type=value_error, input_value=ArgsKwargs((), "
+        f"{{'max_model_len': {user_len}}}), input_type=ArgsKwargs]",
+        "    For further information visit https://errors.pydantic.dev/2.13/v/value_error",
+    ]
+
+
+# Обидві форми помилки «контекст більший за межу моделі» (§2.8) як рядки логу, за (user_len, n): однорядкова
+# «ValueError: …» і pydantic-форма vLLM 0.30. Ключ — id параметризації тестів.
+CTX_OVER_MODEL_FORMS: dict[str, Callable[[int, int], list[str]]] = {
+    "valueerror-line": lambda user_len, n: [line_ctx_over_model(user_len, n)],
+    "pydantic-vllm-0.30": lines_ctx_over_model_pydantic,
+}
 
 
 LINE_LESS_THAN_DESIRED = _ERR + (
@@ -211,6 +253,9 @@ class FakeLauncher:
     (повертає None — не невдача); для юніта з stop_fails stop() повертає False, юніт лишається живим.
     active() для юніта з unknown повертає None (стан невідомий).
     kill(unit) — керування з тесту: юніт помер сам (як vLLM, що впав на старті, або після перезавантаження).
+    before_alive(unit) — керування з тесту: викликається в start() після запису виклику, але до того, як юніт
+    стане живим (stop, що прийшов посеред запуску, §2.9). on_stop(unit) — після вдалого stop() (звільнення
+    пам'яті карти, §2.10a).
     Переживає RunnerEnv.restart(): юніти systemd живуть незалежно від менеджера (§2.10).
     """
 
@@ -220,6 +265,8 @@ class FakeLauncher:
         self.alive: set[str] = set()
         self.unknown: set[str] = set()  # юніти, для яких active() → None (стан невідомий, §2 заголовок)
         self.stop_fails: set[str] = set()  # юніти, для яких stop() → False (невдача, §2.9)
+        self.before_alive: Callable[[str], None] | None = None
+        self.on_stop: Callable[[str], None] | None = None
 
     def start(self, unit: Any, argv: Any, env: Any, log: Any) -> None:
         call = StartCall(
@@ -229,6 +276,8 @@ class FakeLauncher:
             log=log,
         )
         self.calls.append(call)
+        if self.before_alive is not None:
+            self.before_alive(call.unit)
         self.alive.add(call.unit)
 
     def stop(self, unit: Any) -> bool | None:
@@ -236,6 +285,8 @@ class FakeLauncher:
         if str(unit) in self.stop_fails:
             return False
         self.alive.discard(str(unit))
+        if self.on_stop is not None:
+            self.on_stop(str(unit))
         return None
 
     def active(self, unit: Any) -> bool | None:
@@ -452,7 +503,7 @@ class RunnerEnv:
 
     @staticmethod
     def unit(name: str) -> str:
-        return UNIT_PREFIX + name
+        return UNIT_PREFIX + name + UNIT_SUFFIX
 
     def starts(self, name: str) -> list[StartCall]:
         """Усі виклики launcher.start для юніта моделі name (спроби старту по порядку)."""
@@ -467,6 +518,28 @@ class RunnerEnv:
 
     def port(self, name: str) -> int | None:
         return port_of(self.argv(name))
+
+    def card_uuid(self, gpu: int) -> str:
+        """uuid карти gpu з фальшивого бекенда (те саме поле uuid, що в картці /api/overview, SPEC-GPU-001 §7.2) —
+        очікуване CUDA_VISIBLE_DEVICES старту на цій карті (§2.6)."""
+        infos = self.backend.info()
+        for info in infos:
+            if info.index == gpu:
+                return str(info.uuid)
+        raise AssertionError(f"fake backend: expected a card with index {gpu}, got indexes {[i.index for i in infos]!r}")
+
+    def gpu_of(self, call: StartCall) -> Any:
+        """Карта старту call за його CUDA_VISIBLE_DEVICES (§2.6): index карти, чий uuid з фальшивого бекенда (номер —
+        лише коли uuid порожній) дорівнює значенню змінної.
+
+        Не збіглося ні з однією картою — сире значення (None — змінної немає), щоб повідомлення тесту показало, що
+        саме передано vLLM (напр. номер '3' замість uuid карти 3).
+        """
+        value = call.env.get("CUDA_VISIBLE_DEVICES")
+        for info in self.backend.info():
+            if value == (str(info.uuid) if info.uuid else str(info.index)):
+                return info.index
+        return value
 
     def fractions(self, name: str) -> list[float | None]:
         """--gpu-memory-utilization кожної спроби старту name."""
@@ -597,7 +670,7 @@ STUB_COMPLETION: dict[str, Any] = {
 
 
 def _make_handler(upstream: StubUpstream) -> type[BaseHTTPRequestHandler]:
-    """Клас обробника запитів, що пише кожен POST у upstream.requests і відповідає STUB_COMPLETION."""
+    """Клас обробника запитів, що пише кожен POST у upstream.requests і відповідає upstream.response."""
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 — сигнатура базового класу
@@ -625,7 +698,7 @@ def _make_handler(upstream: StubUpstream) -> type[BaseHTTPRequestHandler]:
             except ValueError:
                 payload = None
             upstream.requests.append({"path": self.path, "json": payload})
-            data = json.dumps(STUB_COMPLETION).encode("utf-8")
+            data = json.dumps(upstream.response).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -638,13 +711,15 @@ def _make_handler(upstream: StubUpstream) -> type[BaseHTTPRequestHandler]:
 class StubUpstream:
     """Крихітний HTTP-сервер на 127.0.0.1 замість vLLM (§3: пересилання на 127.0.0.1:<port>).
 
-    Приймає будь-який POST, запам'ятовує шлях і розібраний JSON тіла в requests і відповідає STUB_COMPLETION.
+    Приймає будь-який POST, запам'ятовує шлях і розібраний JSON тіла в requests і відповідає response
+    (типово STUB_COMPLETION; тест може підмінити, напр. відповіддю без тексту — §4 empty_answer).
     Порт вибирає ОС (bind на 0). Сокет слухає вже після конструктора, тож запит, що прийшов раніше, ніж потік
     почав serve_forever, чекає в черзі, а не падає — синхронізації сном немає.
     """
 
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
+        self.response: dict[str, Any] = STUB_COMPLETION
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(self))
         self.port = int(self.httpd.server_address[1])
         self._thread = threading.Thread(target=self.httpd.serve_forever, name="stub-vllm", daemon=True)

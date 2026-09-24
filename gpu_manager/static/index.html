@@ -49,7 +49,12 @@
   .pill.free { color: var(--ok); } .pill.reserved { color: var(--accent); }
   .pill.busy, .pill.reserved_expired { color: var(--warn); } .pill.unknown { color: var(--hot); }
   .nums { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 8px 0 6px; }
-  .num { background: var(--chip); border-radius: 10px; padding: 5px 8px; }
+  .num { background: var(--chip); border-radius: 10px; padding: 5px 8px; display: flex; gap: 7px; align-items: stretch; }
+  /* «Акумулятор»: вертикальний стовпчик, заповнений на частку від шкали плитки */
+  .batt { flex: none; width: 7px; border-radius: 3px; background: rgb(127 127 127 / 0.25); display: flex;
+          align-items: flex-end; overflow: hidden; }
+  .batt i { display: block; width: 100%; background: var(--accent); transition: height 0.4s; }
+  .batt i.t-ok { background: var(--ok); } .batt i.t-warn { background: var(--warn); } .batt i.t-hot { background: var(--hot); }
   .num span { display: block; font-size: 11px; color: var(--muted); }
   .num strong { font-size: 20px; font-variant-numeric: tabular-nums; }
   .t-ok { color: var(--ok); } .t-warn { color: var(--warn); } .t-hot { color: var(--hot); }
@@ -189,7 +194,7 @@
 </details>
 <details class="fold" id="mcp">
   <summary>Підключити агента (MCP)</summary>
-  <p>Потрібен TailScale у нашій мережі. Перевірка:</p>
+  <p>Потрібен мережевий доступ до сервера (напр. Tailscale). Перевірка:</p>
   <div class="cmd"><pre data-t="curl http://{host}/healthz"></pre><button type="button">⧉</button></div>
   <p>Система: <select id="agent-kind" aria-label="Система ШІ">
     <option value="claude">Claude Code</option><option value="antigravity">Google Antigravity</option>
@@ -198,6 +203,9 @@
   <h3>Програми (OpenAI API)</h3>
   <p>Модель — її «назва для агентів»; <code>назва@промпт</code> додає збережений системний промпт.</p>
   <div class="cmd"><pre data-t="http://{host}/v1"></pre><button type="button">⧉</button></div>
+  <h3>OpenCode з моделлю сервера</h3>
+  <p>Модель: <select id="oc-model" aria-label="модель для OpenCode"></select></p>
+  <div id="oc-steps"></div>
 </details>
 <footer id="build"></footer>
 
@@ -275,7 +283,12 @@ function tempClass(t, slowdown) {
   const limit = slowdown || SLOWDOWN_FALLBACK_C;
   return t === null ? "" : t >= limit - HOT_MARGIN_C ? "t-hot" : t >= limit - WARN_MARGIN_C ? "t-warn" : "t-ok";
 }
-function num(label, value, cls = "") { return el("div", { class: "num" }, el("span", {}, label), el("strong", { class: cls }, value)); }
+// Плитка з числом і «акумулятором»: fill — частка шкали 0..1 (null — даних немає, стовпчик порожній).
+function num(label, value, cls = "", fill = null) {
+  const pct = fill === null || !Number.isFinite(fill) ? 0 : Math.round(100 * Math.min(1, Math.max(0, fill)));
+  return el("div", { class: "num" }, el("div", { class: "batt", "aria-hidden": "true" }, el("i", { class: cls, style: `height:${pct}%` })),
+    el("div", {}, el("span", {}, label), el("strong", { class: cls }, value)));
+}
 
 function makeCard(g) {
   const purpose = el("input", { placeholder: "Мета (YOLO, симуляція…)", maxlength: "120" });
@@ -316,9 +329,10 @@ function render(g) {
     el("span", { class: `pill ${g.status}` }, STATUS[g.status] || g.status));
   const t = g.temperature_c;
   c.nums.replaceChildren(
-    num("темп.", t === null ? "—" : `${t}°`, tempClass(t, g.temp_slowdown_c)),
-    num("навант.", g.util_pct === null ? "—" : `${g.util_pct}%`),
-    num("потужн.", g.power_w === null ? "—" : `${Math.round(g.power_w)} W`));
+    // Шкали: температура — до порогу, з якого карта скидає частоти; потужність — до межі потужності карти.
+    num("темп.", t === null ? "—" : `${t}°`, tempClass(t, g.temp_slowdown_c), t === null ? null : t / (g.temp_slowdown_c || SLOWDOWN_FALLBACK_C)),
+    num("навант.", g.util_pct === null ? "—" : `${g.util_pct}%`, "", g.util_pct === null ? null : g.util_pct / 100),
+    num("потужн.", g.power_w === null ? "—" : `${Math.round(g.power_w)} W`, "", g.power_w === null || !g.power_limit_w ? null : g.power_w / g.power_limit_w));
   const used = g.memory_used_mib ?? 0;
   c.mem.replaceChildren(el("div", { class: "bar" }, el("i", { style: `width:${Math.min(100, 100 * used / g.memory_total_mib).toFixed(1)}%` })),
     `${gib(used)}/${gib(g.memory_total_mib)} GiB`);
@@ -346,7 +360,9 @@ function renderActions(c, g) {
   const r = g.reservation, key = `${me}|${r ? r.user : ""}`;
   if (c.act.dataset.key === key) return;  // кнопки не перемальовуються щосекунди, щоб не губити натискання
   c.act.dataset.key = key;
-  const open = () => { c.purpose.value = r && r.user === me ? r.purpose : ""; fillTerms(c.term); c.form.classList.add("open"); c.purpose.focus(); };
+  // Кнопки живуть між оновленнями, тож мету беремо з останнього стану карти, а не з першого рендеру.
+  const open = () => { const cur = (lastGpus.find(x => x.index === g.index) || g).reservation;
+                       c.purpose.value = cur && cur.user === me ? cur.purpose : ""; fillTerms(c.term); c.form.classList.add("open"); c.purpose.focus(); };
   const release = async (force) => {
     if (force && !confirm(`Зняти бронювання ${r.user} з GPU ${g.index}?`)) return;
     try { await post("/api/release", { gpu: g.index, user: me, force }); toast(`GPU ${g.index} вільна`); refresh(); refreshJournal(); }
@@ -388,7 +404,7 @@ async function refreshJournal() {
     const entries = await r.json();
     document.getElementById("journal").replaceChildren(...(entries.length ? entries.map(e => el("li", {},
       el("time", {}, when(e.ts)),
-      [`${e.user} ${ACTION[e.action] || e.action} ${e.repo ?? "GPU " + e.gpu}`, e.owner ? `(${e.owner})` : "", e.purpose, e.until ? `до ${when(e.until)}` : ""]
+      [`${e.user} ${ACTION[e.action] || e.action} ${e.repo ?? (e.gpu !== undefined ? "GPU " + e.gpu : e.name ?? "")}`, e.owner ? `(${e.owner})` : "", e.purpose, e.until ? `до ${when(e.until)}` : ""]
         .filter(Boolean).join(" · "))) : [el("li", {}, "порожньо")]));
   } catch (e) {}
 }
@@ -428,6 +444,51 @@ function fillHelp() {
   }));
   for (const pre of document.querySelectorAll("#mcp pre[data-t]")) pre.textContent = fill(pre.dataset.t);
 }
+// OpenCode з моделлю сервера як основною: провайдер OpenAI-сумісний (/v1 менеджера), модель — «назва для агентів».
+const OC_CONFIG = `{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "gpu-manager": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "gpu-manager",
+      "options": { "baseURL": "http://{host}/v1" },
+      "models": {
+        "{model}": { "name": "{model}"{limit} }
+      }
+    }
+  },
+  "model": "gpu-manager/{model}"
+}`;
+// Частка контексту під відповідь у limit.output (OpenCode стискає історію, коли вона підходить до context − output),
+// але не більше OC_OUTPUT_MAX токенів.
+const OC_OUTPUT_SHARE = 4, OC_OUTPUT_MAX = 16384;
+function cmdBlock(text) {
+  const b = el("button", { type: "button" }, "⧉"), pre = el("pre", {}, text);
+  b.addEventListener("click", () => copy(pre.textContent, b));
+  return el("div", { class: "cmd" }, pre, b);
+}
+async function fillOpenCode() {
+  const sel = document.getElementById("oc-model"), box = document.getElementById("oc-steps");
+  let list = [];
+  try { list = (await (await fetch("/api/servers")).json()).filter(s => s.status === "running"); } catch (e) {}
+  const cur = sel.value;
+  sel.replaceChildren(...(list.length ? list.map(s => el("option", { value: s.name }, `${s.name} · GPU ${s.gpu}`))
+    : [el("option", { value: "" }, "немає запущених моделей")]));
+  if (list.some(s => s.name === cur)) sel.value = cur;
+  const s = list.find(x => x.name === sel.value);
+  if (!s) { box.replaceChildren(el("p", {}, "Запустіть модель на вкладці «Моделі».")); return; }
+  const ctx = s.max_model_len;
+  const limit = ctx ? `, "limit": { "context": ${ctx}, "output": ${Math.min(OC_OUTPUT_MAX, Math.floor(ctx / OC_OUTPUT_SHARE))} }` : "";
+  const tools = s.extra_args.includes("--enable-auto-tool-choice");
+  box.replaceChildren(
+    el("p", {}, tools ? "Виклик інструментів у моделі ввімкнено ✓"
+      : "OpenCode працює через виклик інструментів: модель має стартувати з аргументами нижче (парсер — з картки моделі на HuggingFace; зазвичай qwen3_coder для нових Qwen, hermes для Qwen2.5, llama3_json для Llama 3, openai для gpt-oss). Сторінка аргументів не задає: попросіть агента (model_start з extra_args) або допишіть їх у data/model_profiles.json і перезапустіть модель."),
+    tools ? "" : cmdBlock("--enable-auto-tool-choice --tool-call-parser <парсер>"),
+    el("p", {}, "У ~/.config/opencode/opencode.json (злити з наявним):"),
+    cmdBlock(OC_CONFIG.replaceAll("{host}", publicHost).replaceAll("{model}", s.name).replace("{limit}", limit)),
+    el("p", {}, `Перевірка: opencode, команда /models → gpu-manager/${s.name}.`));
+}
+document.getElementById("oc-model").addEventListener("change", fillOpenCode);
 async function copy(textValue, button) {
   try { await navigator.clipboard.writeText(textValue); }
   catch (e) {  // http без TLS: Clipboard API недоступний — старий спосіб через виділення
@@ -442,7 +503,7 @@ document.getElementById("me").addEventListener("change", (e) => {
   me = e.target.value; save("gpu_manager_user", me); cards.forEach(c => delete c.act.dataset.key); fillHelp(); refresh();
 });
 const mcpFold = document.getElementById("mcp");
-mcpFold.addEventListener("toggle", () => { if (mcpFold.open) fillHelp(); });
+mcpFold.addEventListener("toggle", () => { if (mcpFold.open) { fillHelp(); fillOpenCode(); } });
 const agentKind = document.getElementById("agent-kind");
 if (AGENT_STEPS[load(AGENT_KEY)]) agentKind.value = load(AGENT_KEY);
 agentKind.addEventListener("change", () => { save(AGENT_KEY, agentKind.value); fillHelp(); });
@@ -529,8 +590,12 @@ function showFlags() { const v = load(SHOW_KEY); return { run: v !== "disk" && v
 const MEM_SLACK_MIB = 256, MIN_FRACTION_PCT = 5;
 function freePct(g) {
   if (!g) return 100;
+  if (!g.memory_total_mib) return MIN_FRACTION_PCT;  // нечитна карта: пам'яті не знаємо
   return Math.max(MIN_FRACTION_PCT, Math.min(100, Math.floor(100 * (g.memory_total_mib - (g.memory_used_mib ?? 0) - MEM_SLACK_MIB) / g.memory_total_mib)));
 }
+// Вибір у формі «Новий запуск» за repo: список моделей перемальовується кожні 2 с, і без цього форма скидалась
+// до першої вільної карти, щойно фокус ішов з поля, — «Запустити» стартувало б не там.
+const runChoice = new Map();
 function runForm(repo) {
   const gpu = el("select", {}, ...lastGpus.map(g => el("option", { value: String(g.index) },
     `GPU ${g.index} · ${gib(g.memory_total_mib - (g.memory_used_mib ?? 0))} GiB${g.reservation ? " 🔒" : ""}`)));
@@ -543,9 +608,13 @@ function runForm(repo) {
                        label.textContent = v >= max ? `${v}% макс` : `${v}%`;
                        label.title = v >= max ? "уся вільна пам'ять карти; менеджер підбере сам" : "частка пам'яті карти"; };
   const reset = () => { const max = freePct(card()); slider.max = String(max); slider.value = String(max); show(); };
-  gpu.addEventListener("change", reset);
-  slider.addEventListener("input", show);
+  const keep = () => runChoice.set(repo, { gpu: gpu.value, pct: Number(slider.value) >= Number(slider.max) ? "max" : slider.value });
+  gpu.addEventListener("change", () => { reset(); keep(); });
+  slider.addEventListener("input", () => { show(); keep(); });
+  const was = runChoice.get(repo);
+  if (was && lastGpus.some(g => String(g.index) === was.gpu)) gpu.value = was.gpu;
   reset();
+  if (was && was.pct !== "max" && Number(was.pct) <= Number(slider.max)) { slider.value = was.pct; show(); }
   const form = el("form", { class: "run new" }, el("span", { class: "cap" }, "Новий запуск:"), gpu,
     el("div", { class: "slider" }, slider, label), el("button", { class: "primary", type: "submit" }, "Запустити"));
   form.addEventListener("submit", async (e) => {
@@ -553,6 +622,7 @@ function runForm(repo) {
     // Крайнє праве положення = «хай менеджер вибере сам» (драбина, профіль); інакше — явна частка.
     const fraction = Number(slider.value) >= Number(slider.max) ? "" : (Number(slider.value) / 100).toFixed(2);
     try { const r = await post("/api/servers/start", { repo, gpu: Number(gpu.value), user: me, fraction });
+          runChoice.delete(repo);
           toast(`${r.name}: стартує на GPU ${r.gpu}, порт ${r.port}, частка ${r.fraction}`); refreshModels(); refreshJournal(); }
     catch (err) { toast(err.message); }
   });
@@ -702,7 +772,9 @@ for (const [id, key] of [["f-run", "run"], ["f-disk", "disk"]]) {
   });
 }
 // ---- чат з моделлю: історія лише в пам'яті сторінки; обмеження вирішує модель (vLLM), не сторінка ------------
-const chat = { model: "", messages: [], atts: [], ctrl: null };
+// view — що видно в журналі розмови (дані, не HTML: так її безпечно відновити); busy — іде надсилання (разом із
+// перетворенням PDF), друга репліка чекає; conv — номер розмови: відповідь старої в нову не потрапляє.
+const chat = { model: "", messages: [], view: [], atts: [], ctrl: null, busy: false, conv: 0 };
 // Розширення, які читаються як текст і йдуть у репліку текстом (так їх приймає будь-яка модель).
 const TEXT_EXT = /\.(txt|md|csv|tsv|json|jsonl|log|py|js|ts|html|css|xml|yaml|yml|toml|ini|sh|c|h|cpp|java|go|rs|sql)$/i;
 async function refreshChatModels() {
@@ -713,9 +785,15 @@ async function refreshChatModels() {
     const cur = sel.value;
     sel.replaceChildren(...(list.length ? list.map(s => el("option", { value: s.name }, `${s.name} · GPU ${s.gpu}`))
       : [el("option", { value: "" }, "немає запущених моделей")]));
+    if (chat.model && !list.some(s => s.name === chat.model)) chat.model = list.length ? list[0].name : "";
     const want = chat.model || cur;
     if (list.some(s => s.name === want)) sel.value = want;
   } catch (e) {}
+}
+function showBubble(v) {  // запис розмови на екрані: текст — textContent, картинки — src; без innerHTML
+  const b = chatBubble(v.kind, v.text);
+  for (const a of v.atts || []) b.append(a.img ? el("img", { src: a.img, alt: a.name }) : el("div", { class: "att" }, a.label));
+  return b;
 }
 function chatBubble(kind, text) {
   const b = el("div", { class: `msg ${kind}` }, text);
@@ -746,24 +824,34 @@ function renderAtts() {
   }));
 }
 function saveChat() {
-  const log = document.getElementById("chat-log");
-  // Вміст журналу створено через textContent, тож його серіалізація безпечна для відновлення.
-  if (!sessionSet("gm_chat", JSON.stringify({ model: chat.model, messages: chat.messages, html: log.innerHTML })))
-    sessionSet("gm_chat", JSON.stringify({ model: chat.model, messages: chat.messages.map(stripImages), html: log.innerHTML.replace(/<img[^>]*>/g, "") }));
+  if (sessionSet("gm_chat", JSON.stringify({ model: chat.model, messages: chat.messages, view: chat.view }))) return;
+  // Не влізло (картинки, PDF як є): без вкладень; не влізло й так — сказати, а не губити репліки мовчки.
+  const view = chat.view.map(v => ({ ...v, atts: (v.atts || []).map(a => a.img ? { label: `🖼 ${a.name}` } : a) }));
+  if (!sessionSet("gm_chat", JSON.stringify({ model: chat.model, messages: chat.messages.map(stripFiles), view })))
+    toast("Розмова завелика для сховища вкладки: після оновлення сторінки її не буде");
 }
-function stripImages(m) {  // запасний варіант, якщо картинки не влізли в сховище сесії
-  return Array.isArray(m.content) ? { ...m, content: m.content.filter(p => p.type !== "image_url") } : m;
+function stripFiles(m) {  // запасний варіант: картинки й файли не влізли в сховище сесії
+  return Array.isArray(m.content) ? { ...m, content: m.content.filter(p => p.type !== "image_url" && p.type !== "file") } : m;
 }
 function startChat() {
+  chat.conv++;
   if (chat.ctrl) chat.ctrl.abort();
   chat.model = document.getElementById("chat-model").value;
-  chat.messages = []; chat.atts = []; renderAtts();
+  chat.messages = []; chat.view = []; chat.atts = []; renderAtts();
   document.getElementById("chat-log").replaceChildren();
   sessionSet("gm_chat_draft", "");
   saveChat();
   if (!chat.model) toast("Немає запущених моделей: запустіть на вкладці «Моделі»");
 }
 async function sendChat() {
+  if (chat.busy) return;  // Ctrl+Enter обходить вимкнену кнопку; поки йде відповідь, друга репліка не йде
+  chat.busy = true;
+  document.getElementById("chat-send").disabled = true;
+  try { await sendChatNow(); }
+  finally { chat.busy = false; document.getElementById("chat-send").disabled = false; }
+}
+async function sendChatNow() {
+  const conv = chat.conv;
   const box = document.getElementById("chat-text");
   const text = box.value.trim();
   if (!text && !chat.atts.length) return;
@@ -787,23 +875,28 @@ async function sendChat() {
     else parts.push({ type: "file", file: { filename: a.name, file_data: a.data } });
   }
   if (bot0) bot0.remove();
-  const user = chatBubble("user", text);
-  for (const a of chat.atts) user.append(a.kind === "image" ? el("img", { src: a.data, alt: a.name })
-    : el("div", { class: "att" }, `📄 ${a.name}${a.kind === "pdf" ? " · " + { file: "як є", text: "текст", images: "зображення" }[a.mode] : ""}`));
+  if (conv !== chat.conv) return;  // поки перетворювався PDF, людина почала нову розмову
+  const uv = { kind: "user", text, atts: chat.atts.map(a => a.kind === "image" ? { img: a.data, name: a.name }
+    : { label: `📄 ${a.name}${a.kind === "pdf" ? " · " + { file: "як є", text: "текст", images: "зображення" }[a.mode] : ""}` }) };
+  chat.view.push(uv); showBubble(uv);
   chat.messages.push({ role: "user", content: parts.length === 1 && parts[0].type === "text" ? text : parts });
   box.value = ""; sessionSet("gm_chat_draft", ""); chat.atts = []; renderAtts(); saveChat();
-  const bot = chatBubble("bot", "…");
-  chat.ctrl = new AbortController();
+  const bv = { kind: "bot", text: "…" };
+  chat.view.push(bv);
+  const bot = showBubble(bv);
+  const ctrl = new AbortController();
+  chat.ctrl = ctrl;
   document.getElementById("chat-stop").hidden = false;
-  document.getElementById("chat-send").disabled = true;
   let answer = "";
+  const fail = (msg) => { bot.className = "msg err"; bot.textContent = msg; bv.kind = "err"; bv.text = msg; chat.messages.pop(); };
   try {
     const r = await fetch("/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: chat.model, messages: chat.messages, stream: true }), signal: chat.ctrl.signal });
+      body: JSON.stringify({ model: chat.model, messages: chat.messages, stream: true }), signal: ctrl.signal });
     if (!r.ok) {  // відмова моделі чи шлюзу — показуємо як є
       const body = await r.text(); let msg = body;
       try { const j = JSON.parse(body); msg = j.error?.message || j.message || body; } catch (e) {}
-      bot.className = "msg err"; bot.textContent = msg; chat.messages.pop(); return;
+      if (conv === chat.conv) fail(msg);
+      return;
     }
     const reader = r.body.getReader(), dec = new TextDecoder();
     let buf = "";
@@ -820,15 +913,15 @@ async function sendChat() {
       const log = document.getElementById("chat-log");
       if (log.scrollHeight - log.scrollTop - log.clientHeight < 80) log.scrollTop = log.scrollHeight;  // не смикати, якщо людина гортає вище
     }
+    bv.text = answer;
     chat.messages.push({ role: "assistant", content: answer });
   } catch (e) {
-    if (e.name === "AbortError") { bot.textContent = (answer || "") + " ⏹"; chat.messages.push({ role: "assistant", content: answer }); }
-    else { bot.className = "msg err"; bot.textContent = "Немає зв'язку з сервером"; chat.messages.pop(); }
+    if (conv !== chat.conv) return;  // «Почати розмову» обірвала відповідь: у нову розмову вона не йде
+    if (e.name === "AbortError") { bot.textContent = bv.text = (answer || "") + " ⏹"; chat.messages.push({ role: "assistant", content: answer }); }
+    else fail("Немає зв'язку з сервером");
   } finally {
+    if (chat.ctrl === ctrl) { chat.ctrl = null; document.getElementById("chat-stop").hidden = true; }
     saveChat();
-    chat.ctrl = null;
-    document.getElementById("chat-stop").hidden = true;
-    document.getElementById("chat-send").disabled = false;
   }
 }
 document.getElementById("tab-chat").addEventListener("click", () => showTab("chat"));
@@ -846,8 +939,8 @@ document.getElementById("chat-text").addEventListener("input", (e) => sessionSet
 (function restoreSession() {
   try {
     const saved = JSON.parse(sessionStorage.getItem("gm_chat") || "null");
-    if (saved) { chat.model = saved.model || ""; chat.messages = saved.messages || [];
-                 document.getElementById("chat-log").innerHTML = saved.html || ""; }
+    if (saved) { chat.model = saved.model || ""; chat.messages = saved.messages || []; chat.view = saved.view || [];
+                 chat.view.forEach(showBubble); }
     document.getElementById("chat-text").value = sessionStorage.getItem("gm_chat_draft") || "";
     const q = sessionStorage.getItem("gm_hf_q");
     if (q) { document.getElementById("hf-q").value = q; search(new Event("submit")); }

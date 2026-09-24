@@ -1,28 +1,28 @@
 """Завантаження config.json — файлу, який редагує людина.
 
-Формат (рішення користувача): розділи, у кожному — налаштування виду {"value": …, "comment": "…"}; ключ
+Формат: розділи, у кожному — налаштування виду {"value": …, "comment": "…"}; ключ
 "comment" на рівні розділу описує сам розділ. Налаштування без пояснення не приймається."""
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import socket
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-# Прослуховування всіх інтерфейсів відкрило б керування картами всій локальній мережі, а не лише TailScale.
-_FORBIDDEN_HOSTS = frozenset({"0.0.0.0", "::", ""})
-# Порти нижче 1024 вимагають root; 65535 — межа TCP.
-# Вхідна тека за замовчуванням — та, що погоджена з користувачем (11.1); налаштування необов'язкове.
+# Вхідна тека за замовчуванням; налаштування необов'язкове.
 _DEFAULT_INBOX = "/srv/gpu-inbox"
-# Типові значення розділу models (необов'язковий, щоб конфіг фази 1 лишався дійсним); пояснення — у config.json.
 # Типові значення vLLM (фаза 3); пояснення — у config.json.
-_VLLM_DEFAULTS = {"bin": ".venv-vllm/bin/vllm", "cuda_home": "/usr/local/cuda", "default_fraction": 1.0, "max_num_seqs": 32,
+_VLLM_DEFAULTS = {"bin": ".venv-vllm/bin/vllm", "cuda_home": "/usr/local/cuda", "default_fraction": 0.95, "max_num_seqs": 32,
                   "start_timeout_s": 900}
+# Типові значення розділу models (необов'язковий, щоб конфіг фази 1 лишався дійсним); пояснення — у config.json.
 # hf_home за замовчуванням — <домашня тека>/hf-cache, рахується при читанні конфігу (не при імпорті модуля).
 _MODELS_DEFAULTS = {"max_parallel_downloads": 2, "min_free_disk_gib": 50,
                     "fit_memory_fraction": 0.9, "fit_overhead_gib": 2.0}
+# Порти нижче 1024 вимагають root; 65535 — межа TCP.
 _MIN_PORT, _MAX_PORT = 1024, 65535
 
 
@@ -81,8 +81,39 @@ def unwrap_settings(node: dict[str, Any], where: str = "") -> dict[str, Any]:
     return out
 
 
+def _str_list(value: Any, name: str) -> tuple[str, ...]:
+    """Список рядків з конфігу. Рядок замість списку розібрався б на літери: "alice" -> ('a', 'l', 'i', 'c', 'e')."""
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ConfigError(f"{name}: expected a list of strings, got {value!r}")
+    return tuple(value)
+
+
+def _refused_host(host: str) -> bool:
+    """Адреса, яку не можна слухати: «усі інтерфейси» в будь-якому записі (0.0.0.0, 0, 0.0, ::) відкрила б
+    керування картами всій локальній мережі, а не лише TailScale; IPv6 сервіс не підтримує (Host у дужках,
+    IPV6_FREEBIND) і не стартував би; порожній рядок — теж «усі інтерфейси»."""
+    if not host.strip():
+        return True
+    try:
+        if ipaddress.ip_address(host).version == 6:
+            return True
+    except ValueError:
+        pass
+    try:
+        return socket.inet_aton(host) == bytes(4)  # inet_aton приймає й скорочені записи: "0", "0.0"
+    except OSError:
+        return False  # ім'я хоста, напр. localhost
+
+
+def _absolute(value: str, base: Path) -> Path:
+    """Шлях з конфігу: ~ розкривається, відносний рахується від теки конфігу, а не від теки запуску менеджера
+    (юніти моделей systemd запускаються з домашньої теки й відносних шляхів не зрозуміли б)."""
+    p = Path(value).expanduser()
+    return (p if p.is_absolute() else base / p).resolve()
+
+
 def load_config(path: Path) -> Config:
-    """Читає й перевіряє конфіг. Відносний data_dir рахується від теки конфігу. Будь-яка вада — ConfigError."""
+    """Читає й перевіряє конфіг. Відносні шляхи рахуються від теки конфігу. Будь-яка вада — ConfigError."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
@@ -92,8 +123,7 @@ def load_config(path: Path) -> Config:
         raise ConfigError(f"{path}: {exc}") from exc
     try:
         server, gpu = raw["server"], raw["gpu"]
-        hosts = tuple(server["hosts"])
-        data_dir = Path(raw["paths"]["data_dir"])
+        hosts = _str_list(server["hosts"], "server.hosts")
         ports = raw["vllm"]["port_range"]
         models = {"hf_home": str(Path.home() / "hf-cache"), **_MODELS_DEFAULTS, **raw.get("models", {})}
         vllm = {**_VLLM_DEFAULTS, **raw["vllm"]}
@@ -101,9 +131,10 @@ def load_config(path: Path) -> Config:
         cfg = Config(
             hosts=hosts,
             port=int(server["port"]),
-            host_names=tuple(dict.fromkeys([*hosts, *server.get("extra_host_names", [])])),
+            host_names=tuple(dict.fromkeys([*hosts, *_str_list(server.get("extra_host_names", []),
+                                                              "server.extra_host_names")])),
             display_timezone=ZoneInfo(server["display_timezone"]),
-            users=tuple(raw["users"]["allowed"]),
+            users=_str_list(raw["users"]["allowed"], "users.allowed"),
             sample_interval_s=float(gpu["sample_interval_s"]),
             ring_keep_s=int(gpu["ring_keep_s"]),
             history_db_interval_s=int(gpu["history_db_interval_s"]),
@@ -112,8 +143,8 @@ def load_config(path: Path) -> Config:
             model_ports=(int(ports[0]), int(ports[1])),
             journal_keep_entries=int(raw["journal"]["keep_entries"]),
             journal_keep_days=float(raw["journal"]["keep_days"]),
-            inbox_dir=Path(raw.get("files", {}).get("inbox_dir", _DEFAULT_INBOX)),
-            hf_home=Path(models["hf_home"]),
+            inbox_dir=_absolute(raw.get("files", {}).get("inbox_dir", _DEFAULT_INBOX), path.parent),
+            hf_home=_absolute(models["hf_home"], path.parent),
             max_parallel_downloads=int(models["max_parallel_downloads"]),
             min_free_disk_gib=float(models["min_free_disk_gib"]),
             fit_memory_fraction=float(models["fit_memory_fraction"]),
@@ -124,12 +155,15 @@ def load_config(path: Path) -> Config:
             vllm_default_fraction=float(vllm["default_fraction"]),
             vllm_start_timeout_s=float(vllm["start_timeout_s"]),
             vllm_max_num_seqs=int(vllm["max_num_seqs"]),
-            data_dir=data_dir if data_dir.is_absolute() else path.parent / data_dir,
+            data_dir=_absolute(raw["paths"]["data_dir"], path.parent),
         )
+    except ConfigError as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
     except (KeyError, IndexError, TypeError, ValueError, ZoneInfoNotFoundError) as exc:
         raise ConfigError(f"{path}: invalid or missing key: {exc!r}") from exc
-    if _FORBIDDEN_HOSTS & set(cfg.hosts):
-        raise ConfigError(f"{path}: server.hosts must name concrete addresses, not {sorted(_FORBIDDEN_HOSTS & set(cfg.hosts))}")
+    refused = [h for h in cfg.hosts if _refused_host(h)]
+    if refused:
+        raise ConfigError(f"{path}: server.hosts must name concrete IPv4 addresses or host names, not {refused}")
     if not cfg.hosts or not cfg.users:
         raise ConfigError(f"{path}: server.hosts and users.allowed must not be empty")
     lo, hi = cfg.model_ports
@@ -137,14 +171,20 @@ def load_config(path: Path) -> Config:
         raise ConfigError(f"{path}: server.port {cfg.port} must be {_MIN_PORT}..{_MAX_PORT}")
     if not _MIN_PORT <= lo <= hi <= _MAX_PORT or lo <= cfg.port <= hi:
         raise ConfigError(f"{path}: vllm.port_range {lo}..{hi} must be within {_MIN_PORT}..{_MAX_PORT} and exclude server.port {cfg.port}")
-    if cfg.journal_keep_entries <= 0 or cfg.journal_keep_days <= 0:
-        raise ConfigError(f"{path}: journal.keep_entries and journal.keep_days must be > 0")
+    # Нуль тут — не «без межі», а тиха поломка: 0 с старту — кожна модель failed, 0 MiB — кожна карта busy.
+    positive = {"gpu.sample_interval_s": cfg.sample_interval_s, "gpu.ring_keep_s": cfg.ring_keep_s,
+                "gpu.history_db_interval_s": cfg.history_db_interval_s, "gpu.history_db_keep_days": cfg.history_db_keep_days,
+                "gpu.busy_memory_mib": cfg.busy_memory_mib, "journal.keep_entries": cfg.journal_keep_entries,
+                "journal.keep_days": cfg.journal_keep_days, "vllm.start_timeout_s": cfg.vllm_start_timeout_s}
+    not_positive = [k for k, v in positive.items() if not v > 0]
+    if not_positive:
+        raise ConfigError(f"{path}: must be > 0: {', '.join(not_positive)}")
+    if not cfg.min_free_disk_gib >= 0 or not cfg.fit_overhead_gib >= 0:
+        raise ConfigError(f"{path}: models.min_free_disk_gib and models.fit_overhead_gib must be >= 0")
     if cfg.vllm_max_num_seqs < 1:
         raise ConfigError(f"{path}: vllm.max_num_seqs must be >= 1")
     if not 0.05 <= cfg.vllm_default_fraction <= 1:
         raise ConfigError(f"{path}: vllm.default_fraction must be in [0.05, 1]")
     if cfg.max_parallel_downloads < 1 or not 0 < cfg.fit_memory_fraction <= 1:
         raise ConfigError(f"{path}: models.max_parallel_downloads must be >= 1 and fit_memory_fraction in (0, 1]")
-    if cfg.sample_interval_s <= 0:
-        raise ConfigError(f"{path}: gpu.sample_interval_s must be > 0")
     return cfg

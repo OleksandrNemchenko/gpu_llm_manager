@@ -122,6 +122,33 @@ def test_models_hf_home_from_config_is_path(write_config, config_dir, tmp_path):
     )
 
 
+# Відносні models.hf_home і куди вони мають вести відносно теки конфігу (§2.1).
+RELATIVE_HF_HOMES = [
+    ("hf-cache", ("hf-cache",)),
+    ("cache/hf", ("cache", "hf")),
+    ("../hf-shared", ("..", "hf-shared")),
+]
+
+
+@pytest.mark.req("SPEC-GPU-002 §2.1")
+@pytest.mark.parametrize(("value", "parts"), RELATIVE_HF_HOMES, ids=[v for v, _ in RELATIVE_HF_HOMES])
+def test_models_hf_home_relative_resolved_from_config_dir(write_config, config_dir, value, parts):
+    """§2.1: відносний models.hf_home — від теки конфігу, а не від поточної теки процесу (вона тут інша)."""
+    cfg = _load(write_config(_settings(config_dir, {"models.hf_home": value})))
+    expected = config_dir.joinpath(*parts).resolve()
+    got = Path(cfg.hf_home).resolve()
+    assert got == expected, f"Config.hf_home for relative {value!r}: expected {expected} (from the config dir), got {cfg.hf_home!r} -> {got}"
+
+
+@pytest.mark.req("SPEC-GPU-002 §2.1")
+@pytest.mark.parametrize("value", [v for v, _ in RELATIVE_HF_HOMES])
+def test_models_hf_home_relative_is_absolute_in_config(write_config, config_dir, value):
+    """§2.1: у Config поле hf_home — абсолютний Path, навіть коли в конфігу шлях відносний."""
+    cfg = _load(write_config(_settings(config_dir, {"models.hf_home": value})))
+    ok = isinstance(cfg.hf_home, Path) and cfg.hf_home.is_absolute()
+    assert ok, f"Config.hf_home for relative {value!r}: expected an absolute Path, got {cfg.hf_home!r}"
+
+
 @pytest.mark.req("SPEC-GPU-002 §2")
 def test_models_secrets_path_next_to_config(write_config, config_dir):
     """§2: secrets_path = <тека конфігу>/secrets.json."""
@@ -130,7 +157,7 @@ def test_models_secrets_path_next_to_config(write_config, config_dir):
     assert Path(cfg.secrets_path).resolve() == expected, f"Config.secrets_path: expected {expected}, got {cfg.secrets_path!r}"
 
 
-# --- Межі (§2.2, §2.4) ---------------------------------------------------------------------------------------------------
+# --- Межі (§2.2–2.5) ---------------------------------------------------------------------------------------------------
 
 
 @pytest.mark.req("SPEC-GPU-002 §2.2")
@@ -162,6 +189,37 @@ def test_models_fraction_inside_range_accepted(write_config, config_dir, value):
     """§2.4: 1 (права межа включна) і мале додатне значення допустимі."""
     cfg = _load(write_config(_settings(config_dir, {"models.fit_memory_fraction": value})))
     assert cfg.fit_memory_fraction == value, f"Config.fit_memory_fraction: expected {value!r}, got {cfg.fit_memory_fraction!r}"
+
+
+@pytest.mark.req("SPEC-GPU-002 §2.3")
+@pytest.mark.parametrize("value", [-1, -0.5])
+def test_models_min_free_disk_negative_refused(write_config, config_dir, value):
+    """§2.3: models.min_free_disk_gib < 0 → ConfigError."""
+    path = write_config(_settings(config_dir, {"models.min_free_disk_gib": value}))
+    _expect_config_error(path, f"models.min_free_disk_gib={value}")
+
+
+@pytest.mark.req("SPEC-GPU-002 §2.3")
+def test_models_min_free_disk_zero_accepted(write_config, config_dir):
+    """§2.3: межа 0 допустима (заборонено лише < 0)."""
+    cfg = _load(write_config(_settings(config_dir, {"models.min_free_disk_gib": 0})))
+    assert cfg.min_free_disk_gib == 0, f"Config.min_free_disk_gib: expected 0 GiB, got {cfg.min_free_disk_gib!r}"
+
+
+@pytest.mark.req("SPEC-GPU-002 §2.5")
+@pytest.mark.parametrize("value", [-0.1, -2])
+def test_models_fit_overhead_negative_refused(write_config, config_dir, value):
+    """§2.5: models.fit_overhead_gib < 0 → ConfigError."""
+    path = write_config(_settings(config_dir, {"models.fit_overhead_gib": value}))
+    _expect_config_error(path, f"models.fit_overhead_gib={value}")
+
+
+@pytest.mark.req("SPEC-GPU-002 §2.5")
+@pytest.mark.parametrize("value", [0, 0.0])
+def test_models_fit_overhead_zero_accepted(write_config, config_dir, value):
+    """§2.5: межа 0 допустима (заборонено лише < 0)."""
+    cfg = _load(write_config(_settings(config_dir, {"models.fit_overhead_gib": value})))
+    assert cfg.fit_overhead_gib == 0, f"Config.fit_overhead_gib: expected 0 GiB, got {cfg.fit_overhead_gib!r}"
 
 
 @pytest.mark.req("SPEC-GPU-002 §2")

@@ -1,4 +1,4 @@
-"""Файл стану, який пише лише програма (data/state.json): бронювання, згодом — запущені моделі.
+"""Файл стану, який пише лише програма (data/state.json): бронювання, черга завантажень, запущені моделі, промпти.
 
 Перезаписується атомарно (тимчасовий файл + rename), тож падіння посеред запису не лишає пів файлу."""
 
@@ -16,6 +16,16 @@ from typing import Any
 
 class StateError(Exception):
     pass
+
+
+def fsync_dir(path: Path) -> None:
+    """fsync теки після os.replace: без нього сам rename може не пережити вимкнення живлення, і після старту
+    лишиться попередня версія файлу, хоча відповідь уже сказала «збережено»."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 class StateStore:
@@ -62,3 +72,5 @@ class StateStore:
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
             raise
+        with contextlib.suppress(OSError):  # файл уже новий; невдалий fsync теки не робить запис невдалим
+            fsync_dir(self._path.parent)

@@ -204,13 +204,15 @@ def test_overview_public_host_first_non_loopback_with_port(env):
     "hosts",
     [
         ["127.0.0.1", "127.0.0.2", "198.51.100.20"],
-        ["::1", "198.51.100.20"],
         ["localhost", "198.51.100.20"],
     ],
-    ids=["ipv4-loopback-range", "ipv6-loopback", "localhost-name"],
+    ids=["ipv4-loopback-range", "localhost-name"],
 )
 def test_public_host_skips_every_loopback(make_env, hosts):
-    """§7.2: loopback — уся 127.0.0.0/8, ::1 і localhost (RFC 1122); public_host — перша адреса поза ними."""
+    """§7.2: loopback — уся 127.0.0.0/8 і localhost (RFC 1122); public_host — перша адреса поза ними.
+
+    ::1 з §7.2 тут немає: §2.5 відмовляє будь-якій IPv6-адресі в server.hosts ще на завантаженні конфігу.
+    """
     # 198.51.100.20 — адреса з документаційного діапазону (RFC 5737), не справжня.
     env = make_env({"server.hosts": hosts})
     with env.client(base_url="http://198.51.100.20:1200") as c:

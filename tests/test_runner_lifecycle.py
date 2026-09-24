@@ -5,11 +5,13 @@
 старті моделюється так: тест дописує в лог моделі data_dir/servers/<name>.log справжній текст помилки vLLM
 (після маркера старту, який пише сам runner) і гасить юніт у FakeLauncher; далі RunnerEnv.die_and_step()
 робить кроки, доки runner не перезапустить юніт або не позначить сервер failed. Рядки помилок —
-у tests/runner_fakes.py, кожен містить рівно один тригер §2.8.
+у tests/runner_fakes.py, кожен містить рівно один тригер §2.8. Stop посеред launcher.start (§2.9) —
+ConcurrentStop через FakeLauncher.before_alive.
 """
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 import pytest
@@ -18,11 +20,14 @@ from .conftest import MEM_TOTAL_MIB, T0
 from .model_fakes import REPO, expect_manager_error, model_dir
 from .runner_fakes import (
     COMPILE_LINES,
+    CTX_OVER_MODEL_FORMS,
     DEFAULT_NAME,
     FRACTION_EMPTY,
+    FRACTION_EMPTY_NO_CAP,
     GPU,
     GPU_B,
     LADDER_BELOW_DEFAULT,
+    LADDER_BELOW_NO_CAP,
     LINE_INFO,
     LINE_INFO_REMOTE_CODE,
     LINE_KV_CACHE,
@@ -32,6 +37,7 @@ from .runner_fakes import (
     LINE_REMOTE_CODE,
     LINE_REMOTE_CODE_BARE,
     LINE_UNRECOGNIZED,
+    NO_DEFAULT_CAP,
     PORT_FIRST,
     PROFILE_FIELDS,
     START_TIMEOUT_S,
@@ -116,7 +122,8 @@ def test_profile_keeps_auto_tuned_fraction(runner_env):
     profile = env.profiles().get(REPO) or {}
     fraction = profile.get("fraction")
     got = (round(float(fraction), 4) if isinstance(fraction, (int, float)) else fraction, profile.get("attempts"))
-    assert got == (0.95, 2), f"profile after one retry 0.99 -> 0.95: expected (fraction 0.95, attempts 2), got {got!r}"
+    expected = (LADDER_BELOW_DEFAULT[0], 2)  # 0.95 → щабель нижче 0.92, друга спроба
+    assert got == expected, f"profile after one retry {FRACTION_EMPTY} -> {expected[0]}: expected (fraction, attempts) {expected!r}, got {got!r}"
 
 
 def _profile_06() -> dict[str, Any]:
@@ -213,6 +220,63 @@ def test_retry_estimated_len_below_1024_taken_as_is(runner_env):
     env.die_and_step(NAME, [line_estimated_len(700)])
     got = env.max_lens(NAME)
     assert got == [None, 700], f"max_model_len per attempt after an estimated length of 700: expected [None, 700], got {got!r}"
+
+
+CTX_USER_LEN = 8192  # заданий у запиті контекст
+CTX_MODEL_LIMIT = 4096  # межа моделі з рядка vLLM (max_position_embeddings=4096)
+CTX_FORMS = sorted(CTX_OVER_MODEL_FORMS)  # однорядкова «ValueError: …» і pydantic-форма vLLM 0.30 (§2.8)
+
+
+def _ctx_lines(form: str) -> list[str]:
+    """Рядки логу помилки «контекст 8192 більший за межу моделі 4096» у формі form."""
+    return CTX_OVER_MODEL_FORMS[form](CTX_USER_LEN, CTX_MODEL_LIMIT)
+
+
+@pytest.mark.req("SPEC-GPU-003 §2.8")
+@pytest.mark.parametrize("form", CTX_FORMS)
+def test_retry_ctx_over_model_sets_model_limit(runner_env, form):
+    """§2.8: «greater than the derived max_model_len (max_position_embeddings=4096» → наступна спроба з
+    max_model_len 4096; частка не змінюється. У pydantic-формі тригер — у рядку без слова Error."""
+    env = runner_env
+    env.start(max_model_len=CTX_USER_LEN)
+    env.die_and_step(NAME, _ctx_lines(form))
+    got = (env.max_lens(NAME), env.fractions(NAME))
+    expected = ([CTX_USER_LEN, CTX_MODEL_LIMIT], [FRACTION_EMPTY, FRACTION_EMPTY])
+    assert got == expected, f"retry after 'greater than the derived max_model_len': expected (max_model_len, fraction) per attempt {expected!r}, got {got!r}"
+
+
+@pytest.mark.req("SPEC-GPU-003 §2.8")
+@pytest.mark.parametrize("form", CTX_FORMS)
+def test_retry_ctx_over_model_one_auto_change(runner_env, form):
+    """§2.8: одна спроба — одна зміна: після автоповтору за межею моделі в auto_changes рівно один запис."""
+    env = runner_env
+    env.start(max_model_len=CTX_USER_LEN)
+    env.die_and_step(NAME, _ctx_lines(form))
+    changes = env.server(NAME).get("auto_changes")
+    count = len(changes) if isinstance(changes, list) else None
+    assert count == 1, f"auto_changes after one retry on the model's length limit: expected a list of 1 change, got {changes!r}"
+
+
+@pytest.mark.req("SPEC-GPU-003 §2.8")
+@pytest.mark.req("SPEC-GPU-003 §2.7")
+@pytest.mark.parametrize("form", CTX_FORMS)
+def test_ctx_over_model_failure_hint_with_n(runner_env, form):
+    """§2.7–2.8, коди підказок: спроби вичерпано, остання помилка — контекст більший за межу моделі →
+    failed з error_code hint_ctx_over_model і n = 4096.
+
+    Чотири перші падіння — «estimated maximum model length» (20000 → 19456, 15000 → 14336, 12000 → 11264,
+    9000 → 8192), тож п'ята спроба йде з max_model_len 8192, і vLLM відмовляє: 8192 > 4096."""
+    env = runner_env
+    env.start()
+    for n in (20000, 15000, 12000, 9000):
+        env.die_and_step(NAME, [line_estimated_len(n)])
+    env.die_and_step(NAME, _ctx_lines(form))
+    record = env.server(NAME)
+    params = record.get("error_params")
+    n = params.get("n") if isinstance(params, dict) else None
+    got = (len(env.starts(NAME)), record.get("status"), record.get("error_code"), str(n))
+    expected = (5, "failed", "hint_ctx_over_model", str(CTX_MODEL_LIMIT))
+    assert got == expected, f"5th failure on the model's length limit: expected (starts, status, error_code, n) {expected!r}, got {record!r}"
 
 
 @pytest.mark.req("SPEC-GPU-003 §2.8")
@@ -316,14 +380,16 @@ def test_info_line_is_not_error_line(runner_env):
 
 
 @pytest.mark.req("SPEC-GPU-003 §2.8")
-def test_retry_fraction_ladder(runner_env):
-    """§2.8: «less than desired GPU memory utilization» → частка щоразу на щабель нижче: 0.99 → 0.95 → 0.92 → 0.9."""
-    env = runner_env
+def test_retry_fraction_ladder(make_runner_env):
+    """§2.8: «less than desired GPU memory utilization» → частка щоразу на щабель нижче: 0.99 → 0.95 → 0.92 → 0.9.
+    vllm.default_fraction 1.0: з типовою 0.95 драбина почалася б із 0.95, і щабель з частки поза драбиною
+    (0.99 → 0.95) лишився б неперевіреним."""
+    env = make_runner_env(NO_DEFAULT_CAP)
     env.start()
-    for _ in LADDER_BELOW_DEFAULT:
+    for _ in LADDER_BELOW_NO_CAP:
         env.die_and_step(NAME, [LINE_LESS_THAN_DESIRED])
     got = env.fractions(NAME)
-    expected = [FRACTION_EMPTY, *LADDER_BELOW_DEFAULT]
+    expected = [FRACTION_EMPTY_NO_CAP, *LADDER_BELOW_NO_CAP]
     assert got == expected, f"fraction per attempt: expected {expected!r}, got {got!r}"
 
 
@@ -334,8 +400,8 @@ def test_retry_oom_lowers_fraction_first(runner_env):
     env.start()
     env.die_and_step(NAME, [LINE_OOM])
     got = (env.fractions(NAME), env.max_lens(NAME))
-    expected = ([FRACTION_EMPTY, 0.95], [None, None])
-    assert got == expected, f"retry after OOM at 0.99: expected (fractions, max_model_lens) {expected!r}, got {got!r}"
+    expected = ([FRACTION_EMPTY, LADDER_BELOW_DEFAULT[0]], [None, None])
+    assert got == expected, f"retry after OOM at {FRACTION_EMPTY}: expected (fractions, max_model_lens) {expected!r}, got {got!r}"
 
 
 @pytest.mark.req("SPEC-GPU-003 §2.8")
@@ -466,6 +532,23 @@ def test_retry_reads_only_last_start_log(runner_env):
     assert got == expected, f"second death with a remote-code error: expected (starts, status, error_code) {expected!r}, got {got!r}"
 
 
+@pytest.mark.req("SPEC-GPU-003 §2.8")
+def test_retry_ctx_over_model_reads_only_last_start_log(runner_env):
+    """§2.8: «greater than the derived max_model_len» шукається в будь-якому рядку, але лише логу ОСТАННЬОГО старту —
+    pydantic-рядок першого старту не дає третьої спроби, коли другий падає з remote-code."""
+    env = runner_env
+    env.start(max_model_len=CTX_USER_LEN)
+    env.die_and_step(NAME, _ctx_lines("pydantic-vllm-0.30"))
+    env.die_and_step(NAME, [LINE_REMOTE_CODE])
+    record = env.server(NAME)
+    got = (len(env.starts(NAME)), record.get("status"), record.get("error_code"))
+    expected = (2, "failed", "hint_remote_code")
+    assert got == expected, (
+        f"second death with a remote-code error after a ctx-over-model retry: expected (starts, status, error_code) "
+        f"{expected!r}, got {got!r}"
+    )
+
+
 @pytest.mark.req("SPEC-GPU-003 §2.7")
 @pytest.mark.req("SPEC-GPU-003 §2.8")
 def test_unrecognized_error_fails_without_retry(runner_env):
@@ -584,6 +667,94 @@ def test_stop_unknown_server_not_found(runner_env):
     expect_manager_error("server_not_found", runner_env.runner.stop, "ghost", "alice")
 
 
+# Межа очікування stop(), надісланого з launcher.start: якщо runner тримає замок на весь start(), stop чекає на
+# нього, і start() має завершитися сам. Це запобіжник від зависання тесту, а не синхронізація: результат
+# перевіряється лише після ConcurrentStop.finish() (join потоку).
+CONCURRENT_STOP_WAIT_S = 2.0
+CONCURRENT_STOP_JOIN_S = 10.0
+
+
+class ConcurrentStop:
+    """stop(name, user), що приходить, поки launcher.start юніта ще триває (§2.9).
+
+    Ставить FakeLauncher.before_alive: на спробі attempt запуску юніта name — після запису виклику, до того, як
+    юніт стане живим, — в окремому потоці викликається runner.stop(name, user). Окремий потік, бо в сервісі stop
+    приходить з іншого запиту; виклик у тому самому потоці завис би на нереентрантному замку runner.
+    outcome — результат stop() або його виняток (для повідомлення тесту); finish() дочікується потоку.
+    """
+
+    def __init__(self, env: Any, name: str, attempt: int, user: str = "alice") -> None:
+        self.env = env
+        self.name = name
+        self.attempt = attempt
+        self.user = user
+        self.outcome: list[Any] = []
+        self._thread: threading.Thread | None = None
+        env.launcher.before_alive = self._fire
+
+    def _fire(self, unit: str) -> None:
+        if unit != self.env.unit(self.name) or self._thread is not None:
+            return
+        if len(self.env.launcher.starts_of(unit)) != self.attempt:
+            return
+        self._thread = threading.Thread(target=self._stop, name="concurrent-stop", daemon=True)
+        self._thread.start()
+        self._thread.join(timeout=CONCURRENT_STOP_WAIT_S)
+
+    def _stop(self) -> None:
+        try:
+            self.outcome.append(self.env.runner.stop(self.name, self.user))
+        except Exception as exc:  # noqa: BLE001 — виняток stop() — частина результату для повідомлення тесту
+            self.outcome.append(exc)
+
+    def finish(self) -> None:
+        assert self._thread is not None, (
+            f"launcher.start attempt {self.attempt} of {self.env.unit(self.name)!r} never happened: no concurrent stop was sent"
+        )
+        self._thread.join(timeout=CONCURRENT_STOP_JOIN_S)
+        assert not self._thread.is_alive(), (
+            f"runner.stop({self.name!r}) sent during launcher.start: still blocked {CONCURRENT_STOP_JOIN_S} s later"
+        )
+
+
+@pytest.mark.req("SPEC-GPU-003 §2.9")
+def test_stop_during_first_start_leaves_no_live_unit(runner_env):
+    """§2.9: stop, що прийшов посеред launcher.start першого старту, не лишає живого юніта, і модель зникає зі
+    servers() (зупинена)."""
+    from gpu_manager.messages import ManagerError
+
+    env = runner_env
+    stop = ConcurrentStop(env, NAME, attempt=1)
+    start_outcome: Any = None
+    try:
+        start_outcome = env.start()
+    except ManagerError as exc:  # чим відповідає start() у цьому разі, §2.9 не каже — лише для повідомлення
+        start_outcome = exc
+    stop.finish()
+    got = (env.unit(NAME) in env.launcher.alive, NAME in env.names())
+    assert got == (False, False), (
+        f"stop during the first launcher.start: expected (unit alive, listed) (False, False), got {got!r}; "
+        f"stop() -> {stop.outcome!r}, start() -> {start_outcome!r}, servers {env.names()!r}"
+    )
+
+
+@pytest.mark.req("SPEC-GPU-003 §2.9")
+@pytest.mark.req("SPEC-GPU-003 §2.8")
+def test_stop_during_retry_start_leaves_no_live_unit(runner_env):
+    """§2.8–2.9: stop, що прийшов посеред launcher.start автоповтору (перезапуск з poll()), не лишає живого
+    юніта, і модель зникає зі servers()."""
+    env = runner_env
+    env.start()
+    stop = ConcurrentStop(env, NAME, attempt=2)
+    env.die_and_step(NAME, [LINE_LESS_THAN_DESIRED])
+    stop.finish()
+    got = (env.unit(NAME) in env.launcher.alive, NAME in env.names())
+    assert got == (False, False), (
+        f"stop during the auto-retry launcher.start: expected (unit alive, listed) (False, False), got {got!r}; "
+        f"stop() -> {stop.outcome!r}, unit starts {len(env.starts(NAME))}, servers {env.names()!r}"
+    )
+
+
 # --- §2.10 відновлення ------------------------------------------------------------------------------------------------------------
 
 
@@ -623,8 +794,8 @@ def test_restore_leaves_live_unit(runner_env):
 def test_servers_active_and_failed_sorted_by_gpu_port(runner_env):
     """§2.11: servers() — активні й failed (без зупинених), за (gpu, port).
 
-    Три моделі на одній карті — з явною часткою 0.2: з типовою перша забрала б 0.99 і решта отримали б
-    менше 0.05 (§2.4–2.5, Σ часток активних моделей карти)."""
+    Три моделі на одній карті — з явною часткою 0.2: з типовою перша забрала б 0.95, друга — решту 0.05, а третя
+    отримала б 0 < 0.05 (§2.4–2.5, Σ часток активних моделей карти)."""
     env = runner_env
     env.start(name="alpha", gpu=GPU_B)  # 8000
     env.start(name="bravo", gpu=GPU, fraction=0.2)  # 8001

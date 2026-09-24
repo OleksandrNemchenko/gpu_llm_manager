@@ -1,7 +1,7 @@
-"""MCP-оболонка: тонкі інструменти над GpuManager для агентів (Claude Code, Codex).
+"""MCP-оболонка: тонкі інструменти над GpuManager для агентів (Claude Code, Antigravity, Codex, OpenCode).
 
-Відповіді — стислий JSON без відступів, бо кожен символ результату — вхідні токени агента (прохання
-користувача економити токени). Тексти — англійською: їх бачить термінал (рішення 8.3)."""
+Відповіді — стислий JSON без відступів, бо кожен символ результату — вхідні токени агента (економія
+токенів). Тексти — англійською: їх бачить термінал."""
 
 from __future__ import annotations
 
@@ -12,7 +12,8 @@ from zoneinfo import ZoneInfo
 from mcp.server.mcpserver import MCPServer
 
 from .core import GpuManager
-from .mcp_agents import register_agent_tools
+from .inbox import Inbox
+from .mcp_agents import register_agent_tools, register_inbox_tool
 from .mcp_common import READ, WRITE, GpuIndex, call, clock_text, dump
 from .mcp_models import register_model_tools
 from .mcp_servers import register_server_tools
@@ -35,12 +36,13 @@ Times are local (see `tz`)."""
 
 def build_mcp(manager: GpuManager, tz: ZoneInfo, guide: Callable[[], str] | None = None,
               models: ModelStore | None = None, runner: ModelRunner | None = None,
-              prompts: PromptStore | None = None) -> MCPServer:
+              prompts: PromptStore | None = None, inbox: Inbox | None = None) -> MCPServer:
     """Створює MCP-сервер з інструментами gpu_*; tz — пояс для часу у відповідях.
 
     guide — повертає інструкцію для агентів (gpu_guide); рахується під час виклику, бо стан вхідної
     теки може змінитися без перезапуску. None — інструкції немає.
-    models — сховище моделей (фаза 2), runner — запуск моделей (фаза 3); None — їхні інструменти не реєструються."""
+    models — сховище моделей (фаза 2), runner — запуск моделей (фаза 3), inbox — тека файлів для моделей;
+    None — їхні інструменти не реєструються."""
     mcp = MCPServer("gpu-manager", instructions=INSTRUCTIONS)
     when = clock_text(tz)
 
@@ -129,5 +131,7 @@ def build_mcp(manager: GpuManager, tz: ZoneInfo, guide: Callable[[], str] | None
     if runner is not None:
         register_server_tools(mcp, runner, tz)
         if prompts is not None:
-            register_agent_tools(mcp, runner, prompts)
+            register_agent_tools(mcp, runner, prompts, inbox)
+    if inbox is not None:
+        register_inbox_tool(mcp, inbox)
     return mcp

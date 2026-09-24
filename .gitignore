@@ -18,3 +18,5 @@ hf-cache/
 
 # Символьне посилання на хук з домашньої теки (абсолютний шлях поза репозиторієм)
 .claude/hooks/scope_guard.py
+# Локальні дозволи Claude Code цієї машини
+.claude/settings.local.json

@@ -1,6 +1,6 @@
 """Робота з HuggingFace: пошук, опис моделі, вибір файлів для vLLM і оцінка «чи влізе в карту».
 
-Оцінка умовна (рішення користувача): остаточно покаже перший запуск. Вона потрібна, щоб відсіяти явно
+Оцінка умовна: остаточно покаже перший запуск. Вона потрібна, щоб відсіяти явно
 завеликі моделі ще до завантаження десятків гігабайтів."""
 
 from __future__ import annotations
@@ -11,13 +11,15 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
-from huggingface_hub import HfApi, hf_hub_url
+from huggingface_hub import HfApi, hf_hub_url, set_client_factory
 from huggingface_hub.errors import (
     GatedRepoError,
     HfHubHTTPError,
     RepositoryNotFoundError,
+    RevisionNotFoundError,
 )
 from huggingface_hub.utils import build_hf_headers
+from huggingface_hub.utils._http import hf_request_event_hook
 
 from .messages import ManagerError
 
@@ -29,11 +31,24 @@ _WEIGHTS_ST = "*.safetensors"
 _WEIGHTS_BIN = "*.bin"
 # Скільки байтів займає одне значення KV-кешу: vLLM за замовчуванням тримає його у 16 бітах.
 _KV_BYTES = 2
-# Скільки чекати відповіді HF на запит config.json, секунд.
+# Скільки чекати відповіді HF на будь-який запит, секунд.
 _HTTP_TIMEOUT_S = 20
 # Формати FP4: апаратно — лише з compute capability 10.0 (Blackwell); на старіших картах vLLM або не
 # запустить, або емулює повільно. Текст попередження не називає модель карти: він правдивий на будь-якому сервері.
 _FP4_FORMATS = ("nvfp4", "mxfp4", "fp4")
+
+
+def _limit_timeout(request: httpx.Request) -> None:
+    """Тайм-аут прямо в запиті: model_info і list_models передають httpx явне timeout=None, і тайм-аут клієнта
+    на них не діяв би. Хук спрацьовує раніше, ніж транспорт читає тайм-аут."""
+    request.extensions["timeout"] = httpx.Timeout(_HTTP_TIMEOUT_S).as_dict()
+
+
+def limit_hf_requests() -> None:
+    """Тайм-аут для всіх запитів HfApi цього процесу: типовий клієнт huggingface_hub чекає без межі, і завислий
+    HF тримав би пошук чи опис моделі назавжди (і займав робочий потік). Завантаження йдуть в окремих процесах."""
+    set_client_factory(lambda: httpx.Client(event_hooks={"request": [hf_request_event_hook, _limit_timeout]},
+                                            follow_redirects=True, timeout=_HTTP_TIMEOUT_S))
 
 
 def select_files(names: list[str]) -> list[str]:
@@ -100,13 +115,16 @@ def estimate_fit(files: dict[str, int], config: dict[str, Any], card_mib: list[i
         warnings.append("fp8 below sm_89 (e.g. Ampere) runs as weight-only W8A16 (Marlin): memory saved, no speed-up")
     if kv is None:
         warnings.append("KV cache size unknown from config.json (non-standard attention); context estimate skipped")
+    if weights == 0:  # напр. репозиторій лише з GGUF: select_files лишив README, а vLLM завантажити нічого
+        warnings.append("no safetensors/bin weights: vLLM cannot load this repo")
     per_card = {}
     for mib in sorted(set(card_mib)):
         usable = mib * 1024 * 1024 * fraction - weights - overhead_gib * _GIB
         tokens = int(usable // kv) if kv and usable > 0 else (0 if usable <= 0 else None)
         if tokens is not None and isinstance(model_ctx, int):
             tokens = min(tokens, model_ctx)
-        per_card[mib] = {"usable_gib": round(usable / _GIB, 1), "fits": usable > 0, "max_context_tokens": tokens}
+        per_card[mib] = {"usable_gib": round(usable / _GIB, 1), "fits": usable > 0 and weights > 0,
+                         "max_context_tokens": tokens}
     return Fit(
         weights_gib=round(weights / _GIB, 2),
         kv_kib_per_token=round(kv / 1024, 1) if kv else None,
@@ -136,8 +154,8 @@ class HubClient:
             return [{"repo": m.id, "downloads": m.downloads, "likes": m.likes, "gated": bool(m.gated),
                      "task": m.pipeline_tag, "params": m.safetensors.total if m.safetensors else None,
                      "updated": m.last_modified.isoformat() if m.last_modified else None} for m in found]
-        except HfHubHTTPError as exc:
-            raise ManagerError("hf_unavailable", detail=str(exc)[:200]) from exc
+        except (HfHubHTTPError, httpx.HTTPError) as exc:  # httpx.HTTPError — мережа й тайм-аут (_limit_timeout)
+            raise ManagerError("hf_unavailable", detail=str(exc)[:200] or type(exc).__name__) from exc
 
     def files(self, repo: str, revision: str | None) -> tuple[str, dict[str, int], bool]:
         """(commit sha, {файл: розмір} лише вибраних для vLLM, чи gated)."""
@@ -145,8 +163,10 @@ class HubClient:
             info = self._api().model_info(repo, revision=revision, files_metadata=True)
         except RepositoryNotFoundError as exc:
             raise ManagerError("hf_not_found", repo=repo) from exc
-        except HfHubHTTPError as exc:
-            raise ManagerError("hf_unavailable", detail=str(exc)[:200]) from exc
+        except RevisionNotFoundError as exc:  # підклас HfHubHTTPError: без цього «HF недоступний» на постійну помилку
+            raise ManagerError("hf_not_found", repo=f"{repo}@{revision}") from exc
+        except (HfHubHTTPError, httpx.HTTPError) as exc:  # httpx.HTTPError — мережа й тайм-аут (_limit_timeout)
+            raise ManagerError("hf_unavailable", detail=str(exc)[:200] or type(exc).__name__) from exc
         sizes = {s.rfilename: int(s.size or 0) for s in info.siblings or []}
         chosen = select_files(list(sizes))
         return str(info.sha), {n: sizes[n] for n in chosen}, bool(info.gated)
@@ -159,8 +179,8 @@ class HubClient:
             raise ManagerError("hf_gated", repo=repo) from exc
         except RepositoryNotFoundError as exc:
             raise ManagerError("hf_not_found", repo=repo) from exc
-        except HfHubHTTPError as exc:
-            raise ManagerError("hf_unavailable", detail=str(exc)[:200]) from exc
+        except (HfHubHTTPError, httpx.HTTPError) as exc:  # httpx.HTTPError — мережа й тайм-аут (_limit_timeout)
+            raise ManagerError("hf_unavailable", detail=str(exc)[:200] or type(exc).__name__) from exc
 
     def config(self, repo: str, revision: str) -> dict[str, Any]:
         """config.json моделі прямим HTTP-запитом: hf_hub_download поклав би його в кеш, і недокачана модель

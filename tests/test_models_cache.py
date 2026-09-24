@@ -8,11 +8,13 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from .conftest import STRANGER
+from .conftest import STRANGER, T0
 from .model_fakes import (
     GIB,
     GIB_TOLERANCE,
@@ -28,11 +30,14 @@ from .model_fakes import (
     model_dir,
     put_incomplete,
     put_snapshot,
+    sha_of,
 )
 
 pytestmark = pytest.mark.component
 
-LOCAL_FIELDS = {"repo", "size_gib", "revisions", "state", "last_modified"}
+LOCAL_FIELDS = {"repo", "size_gib", "revisions", "revision", "state", "last_modified"}
+SHA_NEW = sha_of(REPO + "@new")  # новіша ревізія REPO, яку підроблений HF віддає після першого завантаження
+NEWER_OUTCOMES = ["downloading", "failed", "cancelled"]  # чим скінчилось (ще не скінчилось) завантаження SHA_NEW
 # Локальна модель для видалення: дві ваги по 768 і 256 MiB (розріджені) + дрібні файли ≈ 1 GiB.
 LOCAL_SIZES = {"model-00001-of-00002.safetensors": 768 * MIB, "model-00002-of-00002.safetensors": 256 * MIB}
 LOCAL_NAMES = ["config.json", *LOCAL_SIZES]
@@ -190,7 +195,7 @@ def test_local_ignores_cache_service_entries(models_env):
 
 @pytest.mark.req("SPEC-GPU-002 §5.4.1")
 def test_local_entry_fields(models_env):
-    """§5.4.1: запис — {repo, size_gib, revisions, state, last_modified}."""
+    """§5.4.1: запис — {repo, size_gib, revisions, revision, state, last_modified}."""
     put_snapshot(models_env.hf_home, REPO, ["config.json"])
     entry = _local(models_env).get(REPO) or {}
     missing = LOCAL_FIELDS - set(entry)
@@ -270,6 +275,82 @@ def test_local_state_partial_after_cancel(models_env):
     env.store.cancel(REPO, "alice")
     got = (_local(env).get(REPO) or {}).get("state")
     assert got == "partial", f"model with a cancelled download: expected state 'partial', got {got!r}"
+
+
+def _set_mtime(snapshot: Path, ts: float) -> None:
+    """mtime теки знімка й усіх її файлів = ts: «найновіша» ревізія не залежить від порядку створення."""
+    for item in [snapshot, *snapshot.rglob("*")]:
+        os.utime(item, (ts, ts))
+
+
+def _completed_then_newer(env: Any, outcome: str) -> None:
+    """Менеджер докачав ревізію sha_of(REPO) (done); далі HF віддає SHA_NEW, і її завантаження — outcome.
+
+    Знімок SHA_NEW частковий (config.json і недокачаний блоб), refs/main вказує на нього і він новіший за
+    mtime: лише правило «ревізія, яку докачав менеджер» дає sha_of(REPO).
+    """
+    env.store.download(REPO, "alice")
+    old = put_snapshot(env.hf_home, REPO, TINY_FILES)
+    env.spawn.last(REPO).finish(0)
+    env.store.poll()
+    assert env.status(REPO) == "done", f"precondition: first download of {REPO!r} expected 'done', got {env.records(REPO)!r}"
+    env.hub.repos[REPO].sha = SHA_NEW
+    env.clock.advance(60)
+    env.store.download(REPO, "alice")
+    new = put_snapshot(env.hf_home, REPO, ["config.json"], sha=SHA_NEW)
+    put_incomplete(env.hf_home, REPO, 64 * MIB, tag="new")
+    _set_mtime(old, T0 - 7200)
+    _set_mtime(new, T0 - 60)
+    if outcome == "failed":
+        append_log(log_path(env.data_dir, REPO), ["ERROR ValueError: unexpected response from the hub"])
+        env.spawn.last(REPO).finish(1)
+        env.store.poll()
+    elif outcome == "cancelled":
+        env.store.cancel(REPO, "alice")
+
+
+@pytest.mark.req("SPEC-GPU-002 §5.4.1")
+@pytest.mark.parametrize("outcome", NEWER_OUTCOMES)
+def test_local_ready_with_completed_revision_and_newer_unfinished(models_env, outcome):
+    """§5.4.1: є повна ревізія, яку менеджер докачав раніше — ready, навіть коли нова ще качається чи не докачалась."""
+    env = models_env
+    _completed_then_newer(env, outcome)
+    got = (_local(env).get(REPO) or {}).get("state")
+    assert got == "ready", f"completed revision + newer one {outcome}: expected state 'ready', got {got!r}"
+
+
+@pytest.mark.req("SPEC-GPU-002 §5.4.1")
+@pytest.mark.parametrize("outcome", NEWER_OUTCOMES)
+def test_local_revision_is_completed_not_newer_partial(models_env, outcome):
+    """§5.4.1: revision — докачана менеджером (остання повна), а не часткова новіша, на яку вже вказує refs/main."""
+    env = models_env
+    _completed_then_newer(env, outcome)
+    got = (_local(env).get(REPO) or {}).get("revision")
+    assert got == sha_of(REPO), f"completed revision + newer one {outcome}: expected revision {sha_of(REPO)!r}, got {got!r} (newer is {SHA_NEW!r})"
+
+
+@pytest.mark.req("SPEC-GPU-002 §5.4.1")
+def test_local_revision_refs_main_without_record(models_env):
+    """§5.4.1: запису менеджера немає — revision та, на яку вказує refs/main, хоч інша ревізія новіша."""
+    env = models_env
+    main = put_snapshot(env.hf_home, REPO, ["config.json"])
+    other = put_snapshot(env.hf_home, REPO, ["config.json"], sha="f" * 40, ref=False)
+    _set_mtime(main, T0 - 7200)
+    _set_mtime(other, T0 - 60)
+    got = (_local(env).get(REPO) or {}).get("revision")
+    assert got == sha_of(REPO), f"refs/main -> {sha_of(REPO)!r}, newer {'f' * 40!r}: expected revision {sha_of(REPO)!r}, got {got!r}"
+
+
+@pytest.mark.req("SPEC-GPU-002 §5.4.1")
+def test_local_revision_newest_without_refs(models_env):
+    """§5.4.1: ні запису, ні refs/main — revision найновіша (тут за mtime; створена першою й менша за іменем)."""
+    env = models_env
+    newer = put_snapshot(env.hf_home, REPO, ["config.json"], sha="1" * 40, ref=False)
+    older = put_snapshot(env.hf_home, REPO, ["config.json"], sha="f" * 40, ref=False)
+    _set_mtime(older, T0 - 7200)
+    _set_mtime(newer, T0 - 60)
+    got = (_local(env).get(REPO) or {}).get("revision")
+    assert got == "1" * 40, f"two revisions without refs/main: expected the newest {'1' * 40!r}, got {got!r}"
 
 
 # --- §5.4.2 delete() ------------------------------------------------------------------------------------------------------------------

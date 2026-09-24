@@ -1,8 +1,8 @@
 ---
 id: SPEC-GPU-002
-status: draft
+status: accepted
 owner: gpu-manager
-verified: 2026-09-23 22:05
+verified: 2026-09-24 12:06
 ---
 
 # Специфікація фази 2: моделі HuggingFace
@@ -21,11 +21,11 @@ verified: 2026-09-23 22:05
 
 | # | Налаштування | Типово | Правило |
 |---|---|---|---|
-| 1 | `models.hf_home` | `<домашня тека>/hf-cache` | кеш HF (`HF_HOME`); моделі лежать у `<hf_home>/hub` |
+| 1 | `models.hf_home` | `<домашня тека>/hf-cache` | кеш HF (`HF_HOME`); моделі лежать у `<hf_home>/hub`; відносний — від теки конфігу, у `Config` — абсолютний |
 | 2 | `models.max_parallel_downloads` | 2 | < 1 → `ConfigError` |
-| 3 | `models.min_free_disk_gib` | 50 | запас диска, що має лишитися після завантаження |
+| 3 | `models.min_free_disk_gib` | 50 | запас диска, що має лишитися після завантаження; < 0 → `ConfigError` |
 | 4 | `models.fit_memory_fraction` | 0.9 | поза (0, 1] → `ConfigError` |
-| 5 | `models.fit_overhead_gib` | 2.0 | запас на активації в оцінці |
+| 5 | `models.fit_overhead_gib` | 2.0 | запас на активації в оцінці; < 0 → `ConfigError` |
 
 Поля `Config`: `hf_home` (`Path`), `max_parallel_downloads`, `min_free_disk_gib`, `fit_memory_fraction`,
 `fit_overhead_gib`, `secrets_path` (= `<тека конфігу>/secrets.json`).
@@ -46,6 +46,8 @@ verified: 2026-09-23 22:05
 або `None`), `per_card` (`{mib: {usable_gib (1 знак), fits, max_context_tokens}}`), `warnings` (англійською):
 `quantization_config.quant_method`, що містить `fp4` (зокрема `nvfp4`, `mxfp4`) → попередження «no hardware support
 below sm_100»; рівно `fp8` → попередження «weight-only W8A16» (тексти не називають модель карти); `kv` невідомий → попередження про контекст.
+Серед файлів немає ваг (`weight_bytes = 0`, напр. репозиторій лише з GGUF) → `fits: false` для кожної карти й
+попередження «no safetensors/bin weights».
 
 ## 4. Клієнт HF (`gpu_manager.hub.HubClient(token)`)
 
@@ -53,8 +55,8 @@ below sm_100»; рівно `fp8` → попередження «weight-only W8A1
 `search(query, limit) -> list[{repo, downloads, likes, gated, task, params, updated}]` (за популярністю);
 `files(repo, revision) -> (sha, {файл: розмір} після select_files, gated)`; `check_access(repo)`;
 `config(repo, revision) -> dict` (config.json **без запису в кеш HF**; немає файла → `{}`).
-Помилки HF → `ManagerError`: немає моделі — `hf_not_found`; немає доступу до gated-моделі — `hf_gated`;
-мережа чи інша помилка HF — `hf_unavailable`.
+Помилки HF → `ManagerError`: немає моделі чи ревізії — `hf_not_found`; немає доступу до gated-моделі — `hf_gated`;
+мережа чи інша помилка HF — `hf_unavailable`. Кожен запит до HF обмежений тайм-аутом 20 с (`hf_unavailable`).
 
 ## 5. Сховище моделей (`gpu_manager.models.ModelStore`)
 
@@ -71,7 +73,8 @@ below sm_100»; рівно `fp8` → попередження «weight-only W8A1
 | 2 | Якщо та сама модель уже активна — новий запис не створюється, повертається поточний стан. |
 | 3 | Якщо всі вибрані файли вже є в знімку ревізії — одразу стан `done`, процес не запускається, у журнал **не** пишеться. |
 | 4 | Gated-модель без доступу → `hf_gated` (перевірка до постановки в чергу). |
-| 5 | Потрібний обсяг = сума файлів − уже наявне; якщо `вільно − потрібно < min_free_disk_gib` → `disk_full`. |
+| 4a | Серед вибраних файлів немає ваг (`weight_bytes = 0`) → `no_vllm_weights` (одразу після опису моделі з HF, раніше за пп. 3–5). |
+| 5 | Потрібний обсяг = сума файлів − уже наявне; якщо `вільно − потрібно − залишок інших активних завантажень < min_free_disk_gib` → `disk_full`. Перед запуском процесу з черги — та сама перевірка, але із залишком лише тих, що вже качаються (`downloading`); не проходить → `failed` з `error_code` `disk_full`. |
 | 6 | Інакше — запис `queued`, журнал `download` (`repo`, `size_gib`), одразу крок черги (`poll`). |
 | 7 | `poll()`: процес, що завершився з кодом 0 → `done` (журнал `download_done`); інакше → `failed` з `error_code` і `error` (журнал `download_failed`, поле `error`); далі в порядку `started` запускаються `queued`, доки активних процесів < `max_parallel_downloads`. |
 | 8 | `cancel(repo, user)`: лише для активного, інакше `download_not_active`; процес зупиняється (SIGTERM, через 5 с — SIGKILL); стан `cancelled`; журнал `download_cancel`. Недокачані файли лишаються. |
@@ -83,7 +86,9 @@ below sm_100»; рівно `fp8` → попередження «weight-only W8A1
 
 Запуск: `spawn([python, "-m", "gpu_manager.download_worker"], stdin=PIPE, stdout=<лог>, stderr=<лог>, env=…)`;
 у `stdin` пишеться JSON `{"repo", "revision", "files": [імена]}` і закривається. Оточення: `HF_HOME=<hf_home>`,
-`HF_TOKEN` — лише якщо токен є. Лог — `<data_dir>/downloads/models--<org>--<name>.log`. При помилці процес
+`HF_TOKEN` — лише якщо токен є. Лог — `<data_dir>/downloads/models--<org>--<name>.log`; кожна спроба спершу
+дописує в нього рядок-маркер `=== gpu-manager download`, і причину невдачі шукають лише після останнього маркера
+(помилка минулої спроби не повторюється в новій). При помилці процес
 пише останнім рядком `ERROR <клас винятку>: <текст>` і виходить з кодом ≠ 0. Відповідність класу коду:
 `GatedRepoError` → `hf_gated`; `RepositoryNotFoundError`, `RevisionNotFoundError` → `hf_not_found`;
 «No space left» у лозі → `disk_full_during`; інше → `download_failed`.
@@ -98,7 +103,7 @@ below sm_100»; рівно `fp8` → попередження «weight-only W8A1
 
 | # | Правило |
 |---|---|
-| 1 | `local()`: моделі (не датасети) з `<hf_home>/hub`: `{repo, size_gib, revisions, state, last_modified}`; `state` = `ready` (немає запису або запис `done`), `downloading` (активний), `partial` (інше). Немає теки — `[]`. |
+| 1 | `local()`: моделі (не датасети) з `<hf_home>/hub`: `{repo, size_gib, revisions, revision, state, last_modified}`; `state` = `ready` (немає запису, запис `done` або є повна ревізія, яку менеджер докачав раніше, — навіть коли нова ревізія ще качається чи не докачалась), `downloading` (активний), `partial` (інше). `revision` — яку запускати: докачана менеджером (остання повна) → на яку вказує `refs/main` → найновіша. Немає теки — `[]`. |
 | 2 | `delete(repo, user)`: активне завантаження → `download_active`; моделі немає на диску → `model_not_local`; інакше видаляються всі ревізії разом із блобами, тека моделі зникає повністю, запис черги видаляється; журнал `model_delete` (`freed_gib`); відповідь `{deleted: true, repo, freed_gib}`. |
 | 3 | `info(repo, revision=None, fraction=None)`: `{repo, revision, gated, files, size_gib, fraction, fit (Fit як словник), local}`; `fraction` поза (0, 1] → `bad_fraction`. |
 | 4 | `search(query, limit=10)`: `limit` обмежується до 1..50. |
@@ -116,6 +121,7 @@ below sm_100»; рівно `fp8` → попередження «weight-only W8A1
 | 7 | `GET /api/version` | | `{version, commit, date, dirty}`; `version` = `gpu_manager.__version__` (число версії не фіксується тестами: його піднімає людина); без комітів `commit`, `date`, `dirty` — `null` |
 
 `build_app(cfg, manager, models=None)`: маршрути 1–6 і MCP-інструменти §7 з'являються лише з `models`.
+Маршрути 1–6 не блокують сервер: поки чекають на HF чи диск, решта запитів (напр. `/api/overview`) відповідає.
 
 ## 7. MCP (формат — SPEC-GPU-001 §8; реєструються, лише якщо `build_mcp(..., models=store)`)
 
@@ -132,7 +138,7 @@ below sm_100»; рівно `fp8` → попередження «weight-only W8A1
 ## 8. Нові коди відмов
 
 `hf_unavailable`, `hf_not_found`, `hf_gated`, `bad_fraction`, `disk_full`, `download_active`, `download_not_active`,
-`model_not_local`; у стані завантаження також `disk_full_during`, `download_failed`.
+`model_not_local`, `no_vllm_weights`; у стані завантаження також `disk_full`, `disk_full_during`, `download_failed`.
 
 ## 9. Уточнення (відповіді на прогалини тестів)
 
