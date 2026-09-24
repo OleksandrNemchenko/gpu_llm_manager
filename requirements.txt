@@ -1,0 +1,13 @@
+mcp==2.2.0
+nvidia-ml-py==13.610.43
+uvicorn==0.53.0
+starlette==1.7.0
+httpx==0.28.1
+anyio==4.15.1
+pytest==9.1.1
+ruff==0.16.8
+pyright==1.1.414
+huggingface_hub==1.32.0
+hf-xet==1.6.0
+pypdfium2==5.13.0
+pillow==12.3.0

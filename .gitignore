@@ -1,0 +1,20 @@
+# Справжні налаштування й секрети машини — лише локально; у git ідуть *.example.json
+config.json
+secrets.json
+
+# Те, що пише програма: бронювання, журнал, історія, логи
+data/
+logs/
+temp/
+
+# Середовища й кеші
+.venv/
+.venv-*/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+hf-cache/
+
+# Символьне посилання на хук з домашньої теки (абсолютний шлях поза репозиторієм)
+.claude/hooks/scope_guard.py

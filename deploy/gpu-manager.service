@@ -1,0 +1,22 @@
+# Користувацький сервіс systemd для менеджера GPU (веб + MCP на порту з config.json).
+# Підключення: systemctl --user link <цей файл> && systemctl --user enable --now gpu-manager
+# Працює після перезавантаження, якщо для користувача сервісу увімкнено linger (loginctl enable-linger).
+# %h — домашня тека користувача сервісу; проєкт лежить у ~/gpu-manager.
+[Unit]
+Description=GPU manager (web page, JSON API, MCP)
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/gpu-manager
+# sg: менеджер systemd користувача стартував до додавання в групу gpuinbox і не передає її сервісам;
+# без групи сервер не читає файли зі спільної теки /srv/gpu-inbox.
+ExecStart=/usr/bin/sg gpuinbox -c "exec %h/gpu-manager/.venv/bin/python -m gpu_manager"
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=5
+# Зупинка: SIGTERM усім процесам сервісу (сервер і його завантаження), через 15 с — SIGKILL.
+KillMode=control-group
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

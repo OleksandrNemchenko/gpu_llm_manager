@@ -1,0 +1,874 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1216" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)">
+<title>Адміністрування GPU та моделей</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9; --card: #fff; --fg: #1b1f24; --muted: #667281; --line: #dde2e8; --chip: #eef1f5;
+    --ok: #1a7f37; --warn: #b26a00; --hot: #c62828; --accent: #2457c5; --on-accent: #fff;
+    --card-reserved: #e6eefc; --card-busy: #fdf1dc; --card-unknown: #fde4e4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1216; --card: #171b21; --fg: #e6e9ed; --muted: #95a1b0; --line: #2a313a; --chip: #222831;
+      --ok: #4cc26b; --warn: #e0a030; --hot: #ff6b6b; --accent: #7aa2ff; --on-accent: #0f1216;
+      --card-reserved: #17233a; --card-busy: #2e2412; --card-unknown: #331a1a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif;
+         -webkit-text-size-adjust: 100%; }
+  header { position: sticky; top: 0; z-index: 2; background: var(--bg); border-bottom: 1px solid var(--line);
+           padding: 8px 16px; padding-top: max(8px, env(safe-area-inset-top)); display: flex; flex-wrap: wrap; gap: 8px;
+           align-items: center; }
+  header b { font-size: 16px; }
+  #free { font-size: 13px; color: var(--muted); }
+  #dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+  #dot.ok { background: var(--ok); } #dot.bad { background: var(--hot); }
+  .grow { flex: 1; }
+  select, input, button { font: inherit; color: inherit; }
+  select, input { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; min-height: 40px; }
+  button { border: 1px solid var(--line); background: var(--chip); border-radius: 10px; padding: 8px 14px; min-height: 40px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+  button.danger { color: var(--hot); }
+  button:disabled { opacity: .4; cursor: default; }
+  main { padding: 12px 16px; display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 12px; min-width: 0; }
+  .card.reserved { background: var(--card-reserved); border-color: var(--accent); }
+  .card.busy, .card.reserved_expired { background: var(--card-busy); border-color: var(--warn); }
+  .card.unknown { background: var(--card-unknown); border-color: var(--hot); }
+  .card:not(.free) .num, .card:not(.free) .bar { background: rgb(127 127 127 / 0.14); }
+  .top { display: flex; align-items: baseline; gap: 6px; }
+  .top b { font-size: 17px; } .top small { color: var(--muted); }
+  .pill { margin-left: auto; font-size: 12px; font-weight: 600; padding: 2px 9px; border-radius: 999px; background: var(--chip); white-space: nowrap; }
+  .pill.free { color: var(--ok); } .pill.reserved { color: var(--accent); }
+  .pill.busy, .pill.reserved_expired { color: var(--warn); } .pill.unknown { color: var(--hot); }
+  .nums { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 8px 0 6px; }
+  .num { background: var(--chip); border-radius: 10px; padding: 5px 8px; }
+  .num span { display: block; font-size: 11px; color: var(--muted); }
+  .num strong { font-size: 20px; font-variant-numeric: tabular-nums; }
+  .t-ok { color: var(--ok); } .t-warn { color: var(--warn); } .t-hot { color: var(--hot); }
+  .mem { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .bar { flex: 1; height: 6px; background: var(--chip); border-radius: 3px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--accent); }
+  .res { margin-top: 8px; font-size: 14px; overflow-wrap: anywhere; }
+  .res.expired { color: var(--warn); }
+  .procs details { margin-top: 6px; font-size: 13px; }
+  .procs summary { cursor: pointer; overflow-wrap: anywhere; }
+  .procs code { display: block; margin-top: 3px; font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+  .act { display: flex; gap: 6px; margin-top: 10px; }
+  .act button { flex: 1; }
+  form.rsv { display: none; margin-top: 8px; gap: 6px; flex-wrap: wrap; }
+  form.rsv.open { display: flex; }
+  form.rsv input { flex: 1 1 100%; min-width: 0; }
+  form.rsv select { flex: 1; }
+  details.journal { margin: 4px 16px 12px; }
+  details.journal summary { cursor: pointer; color: var(--muted); padding: 6px 0; }
+  details.journal ol { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+  details.journal li { padding: 5px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+  details.journal time { color: var(--muted); margin-right: 6px; font-variant-numeric: tabular-nums; }
+  .tabs { display: flex; gap: 6px; padding: 8px 16px 0; }
+  .tabs button { flex: 1; min-height: 36px; }
+  .tabs button.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+  section.models { padding: 12px 16px; display: none; max-width: 900px; }
+  section.models.on { display: block; }
+  section.models h2 { font-size: 15px; margin: 16px 0 6px; color: var(--muted); font-weight: 600; }
+  .search { display: flex; gap: 6px; }
+  .search input { flex: 1; min-width: 0; }
+  .item { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; margin-top: 8px; overflow-wrap: anywhere; }
+  .item b { font-size: 15px; }
+  .item small { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .item .act { margin-top: 8px; }
+  .item .fit { margin-top: 6px; font-size: 13px; }
+  .models-on { margin-top: 6px; font-size: 13px; }
+  .filters { display: flex; gap: 16px; margin: 14px 0 2px; font-size: 14px; color: var(--muted); }
+  .filters input { min-height: 0; width: 18px; height: 18px; vertical-align: -3px; margin-right: 4px; }
+  .run-line { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); }
+  .item pre { margin: 8px 0 0; padding: 8px; background: var(--chip); border-radius: 8px; font-size: 11px;
+             white-space: pre-wrap; overflow-wrap: anywhere; max-height: 50vh; overflow: auto; }
+  form.run { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  form.run select { flex: 0 0 auto; width: auto; }
+  form.run.new { align-items: center; }
+  form.run.new .cap { flex: 1 1 100%; font-size: 12px; color: var(--muted); }
+  .slider { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
+  .slider input { width: 80px; min-height: 0; padding: 0; accent-color: var(--accent); }
+  .slider .pct { min-width: 64px; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .fit .ok { color: var(--ok); } .fit .no { color: var(--hot); } .fit .warn { color: var(--warn); }
+  footer { padding: 4px 16px 24px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  section.chat { padding: 12px 16px; display: none; max-width: 900px; }
+  section.chat.on { display: block; }
+  .chat-top { display: flex; gap: 6px; align-items: center; }
+  .chat-top select { flex: 0 1 auto; }
+  #chat-log { margin: 12px 0; display: flex; flex-direction: column; gap: 10px; min-height: 40vh; max-height: 65vh;
+              overflow-y: auto; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+  .msg { padding: 2px 0; max-width: 92%; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .msg.user { align-self: flex-end; text-align: right; color: var(--accent); }
+  .msg.bot { align-self: flex-start; }
+  .msg.err { align-self: flex-start; color: var(--hot); }
+  .msg img { max-width: 160px; max-height: 120px; border-radius: 8px; display: block; margin: 6px 0 0 auto; }
+  .msg .att, .atts span { font-size: 12px; color: var(--muted); }
+  .composer { display: flex; flex-direction: column; gap: 6px; position: sticky; bottom: 0; background: var(--bg); padding: 6px 0 12px; }
+  .composer textarea { font: inherit; color: inherit; background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+                       padding: 8px 10px; min-height: 64px; resize: vertical; }
+  .composer .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .atts { display: flex; gap: 6px; flex-wrap: wrap; }
+  .atts span { background: var(--chip); border-radius: 8px; padding: 2px 8px; }
+  .atts button { min-height: 0; padding: 0 6px; margin-left: 4px; }
+  .atts select { min-height: 0; padding: 0 4px; font-size: 12px; }
+  #toast { position: fixed; left: 16px; right: 16px; bottom: max(16px, env(safe-area-inset-bottom)); max-width: 560px; margin: 0 auto;
+           padding: 10px 14px; border-radius: 12px; background: var(--fg); color: var(--bg); display: none; z-index: 3; }
+  #toast.show { display: block; }
+  details.fold { margin: 0 16px 12px; font-size: 14px; }
+  details.fold summary { cursor: pointer; color: var(--muted); padding: 6px 0; }
+  details.fold h3 { font-size: 14px; margin: 12px 0 4px; }
+  details.fold p, details.fold li { color: var(--muted); }
+  details.fold p { margin: 4px 0; }
+  details.fold ul { margin: 4px 0; padding-left: 20px; }
+  .cmd { display: flex; gap: 6px; align-items: stretch; margin: 4px 0; }
+  .cmd pre { flex: 1; margin: 0; padding: 8px 10px; background: var(--chip); border-radius: 10px; font-size: 12px;
+             white-space: pre-wrap; overflow-wrap: anywhere; user-select: all; -webkit-user-select: all; }
+  .cmd button { min-height: 0; padding: 4px 10px; }
+</style>
+</head>
+<body>
+<header>
+  <b>Адміністрування GPU та моделей</b><span id="free"></span><span id="dot" title="зв'язок"></span>
+  <span class="grow"></span>
+  <select id="me" aria-label="Хто я"><option value="">Хто я?</option></select>
+</header>
+<nav class="tabs"><button type="button" id="tab-gpus" class="on">GPU</button><button type="button" id="tab-models">Моделі</button><button type="button" id="tab-chat">Чат</button></nav>
+<main id="gpus"></main>
+<section class="chat" id="chat">
+  <div class="chat-top"><select id="chat-model" aria-label="Модель"></select><button type="button" id="chat-start">Почати розмову</button></div>
+  <div id="chat-log"></div>
+  <div class="composer">
+    <div class="atts" id="chat-atts"></div>
+    <textarea id="chat-text" placeholder="Репліка… (Ctrl+Enter — надіслати; картинку можна вставити з буфера)"></textarea>
+    <div class="row"><button type="button" id="chat-attach">📎 Файл</button><input type="file" id="chat-file" multiple hidden>
+      <span class="grow"></span><button type="button" id="chat-stop" hidden>Зупинити</button>
+      <button type="button" id="chat-send" class="primary">Надіслати</button></div>
+  </div>
+</section>
+<section class="models" id="models">
+  <form class="search" id="hf-form"><input id="hf-q" placeholder="Пошук на HuggingFace" autocomplete="off"><button class="primary" type="submit">Знайти</button></form>
+  <div id="hf-results"></div>
+  <div class="filters"><label><input type="checkbox" id="f-run" checked> запущені</label><label><input type="checkbox" id="f-disk" checked> завантажені</label></div>
+  <div id="local"></div>
+</section>
+<details class="journal"><summary>Журнал</summary><ol id="journal"></ol></details>
+<div id="toast" role="status"></div>
+
+<details class="fold">
+  <summary>Як користуватися</summary>
+  <p>Оберіть себе вгорі («Хто я?») — запам'ятається. Без цього можна лише дивитися.</p>
+  <h3>GPU</h3>
+  <ul>
+    <li>Стан кожної карти щосекунди: температура, завантаження, потужність, пам'ять, процеси (натисніть — команда), моделі з портами.</li>
+    <li>Колір: звичайна — вільна; синя — заброньована; жовта — працює без бронювання (процес чи модель) або строк бронювання минув; червона — немає даних.</li>
+    <li>«Зайняти» — позначити карту своєю (мета, строк); «Звільнити» — коли закінчили; «Зняти» — чуже бронювання, лише за домовленістю.</li>
+  </ul>
+  <h3>Моделі</h3>
+  <ul>
+    <li>Пошук на HuggingFace; натисніть на модель — «чи влізе» в карту і «Завантажити».</li>
+    <li>Один список; галочки «запущені» / «завантажені» — що показувати.</li>
+    <li>«Новий запуск»: карта і частка пам'яті повзунком; «макс» — менеджер підбере сам (найбільше пам'яті й контексту).</li>
+    <li>Під запущеною моделлю: її стан, стан карти, «назва для агентів», «Лог», «Зупинити». Інша карта чи порт → «Змінити» (перезапуск на новому місці) або «Скасувати».</li>
+  </ul>
+  <h3>Чат</h3>
+  <ul>
+    <li>Виберіть запущену модель і пишіть; Ctrl+Enter — надіслати, «Зупинити» — обірвати відповідь, «Почати розмову» — з чистого аркуша.</li>
+    <li>📎 — файли, Ctrl+V — картинка з буфера. PDF: «як є», «текст» або «зображення» (сторінки картинками — для моделей із «зором»). Що прийняти — вирішує модель.</li>
+    <li>Розмова живе, поки відкрита вкладка браузера; назавжди нічого не зберігається.</li>
+  </ul>
+  <p>Журнал унизу — хто що робив.</p>
+</details>
+<details class="fold" id="mcp">
+  <summary>Підключити агента (MCP)</summary>
+  <p>Потрібен TailScale у нашій мережі. Перевірка:</p>
+  <div class="cmd"><pre data-t="curl http://{host}/healthz"></pre><button type="button">⧉</button></div>
+  <p>Система: <select id="agent-kind" aria-label="Система ШІ">
+    <option value="claude">Claude Code</option><option value="antigravity">Google Antigravity</option>
+    <option value="codex">OpenAI Codex</option><option value="opencode">OpenCode</option></select></p>
+  <div id="agent-steps"></div>
+  <h3>Програми (OpenAI API)</h3>
+  <p>Модель — її «назва для агентів»; <code>назва@промпт</code> додає збережений системний промпт.</p>
+  <div class="cmd"><pre data-t="http://{host}/v1"></pre><button type="button">⧉</button></div>
+</details>
+<footer id="build"></footer>
+
+<script>
+"use strict";
+const STATUS = { free: "вільна", reserved: "зайнята", reserved_expired: "строк минув", busy: "без бронювання", unknown: "немає даних" };
+const ACTION = { reserve: "зайняв", reserve_update: "змінив", release: "звільнив", release_forced: "зняв чуже",
+                 download: "завантажує", download_done: "завантажив", download_failed: "не завантажив",
+                 download_cancel: "скасував", model_delete: "видалив", model_start: "запустив", model_stop: "зупинив",
+                 model_failed: "— впала модель", model_retry: "— автоповтор моделі", model_move: "переніс", prompt_save: "зберіг промпт",
+                 prompt_delete: "видалив промпт" };
+const SRV_STATUS = { starting: "стартує", running: "працює", failed: "впала", stopped: "зупинена" };
+let lastGpus = [];
+const DL_STATUS = { queued: "у черзі", downloading: "завантажується", done: "готово", failed: "помилка", cancelled: "скасовано" };
+// Як часто оновлювати вкладку «Моделі», мс: прогрес завантаження не потребує щосекундного опитування.
+const MODELS_REFRESH_MS = 2000;
+// Строк бронювання: людина бачить, ДО якого часу (прохання користувача); сервер приймає години.
+const TERMS = [[2, "2 год"], [4, "4 год"], [8, "8 год"], [24, "доба"], [72, "3 доби"], [168, "тиждень"]];
+function untilLabel(hours) { return when(Date.now() / 1000 + hours * 3600); }
+function fillTerms(select) {
+  const keep = select.value;
+  select.replaceChildren(el("option", { value: "" }, "без строку"),
+    ...TERMS.map(([h, t]) => el("option", { value: String(h) }, `до ${untilLabel(h)} (${t})`)),
+    el("option", { value: "custom" }, "свій час…"));
+  select.value = keep;
+}
+// Пороги кольору температури — від порогу, з якого карта сама скидає частоти (NVML, для A40 — 95 °C).
+const HOT_MARGIN_C = 5, WARN_MARGIN_C = 15, SLOWDOWN_FALLBACK_C = 90;
+// Скільки секунд без відповіді сервера вважати втратою зв'язку.
+const STALE_S = 5;
+const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]"]);
+const cards = new Map();
+const openProcs = new Set();  // «карта:pid» розгорнутих процесів
+let me = "", lastOk = 0, publicHost = location.host;
+
+// Вибір користувача живе в cookie на рік (прохання користувача): не вводити щоразу.
+const COOKIE_MAX_AGE_S = 365 * 24 * 3600;
+// Сховище сесії вкладки браузера: живе до її закриття (прохання користувача: нічого не зберігати надовго).
+function sessionSet(key, value) { try { sessionStorage.setItem(key, value); return true; } catch (e) { return false; } }
+function load(key) {
+  const hit = document.cookie.split("; ").find(c => c.startsWith(key + "="));
+  return hit ? decodeURIComponent(hit.slice(key.length + 1)) : "";
+}
+function save(key, value) { document.cookie = `${key}=${encodeURIComponent(value)}; max-age=${COOKIE_MAX_AGE_S}; path=/; samesite=lax`; }
+function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") node.className = v; else if (k.startsWith("on")) node.addEventListener(k.slice(2), v); else node.setAttribute(k, v);
+  }
+  for (const c of children) if (c !== null && c !== undefined) node.append(c);
+  return node;
+}
+function hm(ts) { return new Date(ts * 1000).toLocaleTimeString("uk-UA", { hour: "2-digit", minute: "2-digit" }); }
+function when(ts) {
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  return d.toDateString() === new Date().toDateString() ? hm(ts)
+    : d.toLocaleString("uk-UA", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+function gib(mib) { return mib === null || mib === undefined ? "?" : (mib / 1024).toFixed(1); }
+function toast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.classList.add("show");
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => t.classList.remove("show"), 5000);
+}
+async function post(path, data) {
+  let r;
+  try { r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) }); }
+  catch (e) { throw new Error("Немає зв'язку з сервером"); }
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.error || `Помилка ${r.status}`);
+  return body;
+}
+function tempClass(t, slowdown) {
+  const limit = slowdown || SLOWDOWN_FALLBACK_C;
+  return t === null ? "" : t >= limit - HOT_MARGIN_C ? "t-hot" : t >= limit - WARN_MARGIN_C ? "t-warn" : "t-ok";
+}
+function num(label, value, cls = "") { return el("div", { class: "num" }, el("span", {}, label), el("strong", { class: cls }, value)); }
+
+function makeCard(g) {
+  const purpose = el("input", { placeholder: "Мета (YOLO, симуляція…)", maxlength: "120" });
+  const term = el("select", { "aria-label": "до якого часу" });
+  fillTerms(term);
+  const custom = el("input", { type: "datetime-local", hidden: "" });
+  term.addEventListener("change", () => { custom.hidden = term.value !== "custom"; if (!custom.hidden) custom.focus(); });
+  const form = el("form", { class: "rsv" }, purpose, term, custom,
+    el("button", { class: "primary", type: "submit" }, "OK"),
+    el("button", { type: "button", onclick: () => form.classList.remove("open") }, "✕"));
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      let hours = term.value;
+      if (hours === "custom") {
+        const end = custom.value ? new Date(custom.value).getTime() : NaN;
+        if (!(end > Date.now())) { toast("Вкажіть час у майбутньому"); return; }
+        hours = String((end - Date.now()) / 3600000);
+      }
+      const r = await post("/api/reserve", { gpu: g.index, user: me, purpose: purpose.value, hours });
+      form.classList.remove("open");
+      toast(r.warnings.length ? r.warnings.join(" ") : `GPU ${g.index} зайнята`);
+      refresh(); refreshJournal();
+    } catch (err) { toast(err.message); }
+  });
+  const c = { root: el("article", { class: "card" }), top: el("div", { class: "top" }), nums: el("div", { class: "nums" }),
+              mem: el("div", { class: "mem" }), res: el("div", { class: "res" }), procs: el("div", { class: "procs" }),
+              act: el("div", { class: "act" }), form, purpose, term };
+  c.root.append(c.top, c.nums, c.mem, c.res, c.procs, c.act, form);
+  return c;
+}
+
+function render(g) {
+  let c = cards.get(g.index);
+  if (!c) { c = makeCard(g); cards.set(g.index, c); document.getElementById("gpus").append(c.root); }
+  c.root.className = `card ${g.status}`;
+  c.top.replaceChildren(el("b", {}, `GPU ${g.index}`), el("small", {}, g.name.replace("NVIDIA ", "")),
+    el("span", { class: `pill ${g.status}` }, STATUS[g.status] || g.status));
+  const t = g.temperature_c;
+  c.nums.replaceChildren(
+    num("темп.", t === null ? "—" : `${t}°`, tempClass(t, g.temp_slowdown_c)),
+    num("навант.", g.util_pct === null ? "—" : `${g.util_pct}%`),
+    num("потужн.", g.power_w === null ? "—" : `${Math.round(g.power_w)} W`));
+  const used = g.memory_used_mib ?? 0;
+  c.mem.replaceChildren(el("div", { class: "bar" }, el("i", { style: `width:${Math.min(100, 100 * used / g.memory_total_mib).toFixed(1)}%` })),
+    `${gib(used)}/${gib(g.memory_total_mib)} GiB`);
+  const r = g.reservation;
+  c.res.className = "res" + (r && r.expired ? " expired" : "");
+  c.res.textContent = r ? [`🔒 ${r.user}`, r.purpose, r.until ? (r.expired ? `минуло ${when(r.until)}` : `до ${when(r.until)}`) : ""]
+    .filter(Boolean).join(" · ") : "";
+  c.procs.replaceChildren(...g.processes.map(p => {
+    // Розгорнуті деталі переживають щосекундне оновлення картки.
+    const key = `${g.index}:${p.pid}`;
+    const d = el("details", {},
+      el("summary", {}, `${p.name} · ${p.user ?? "?"} · ${p.used_mib === null ? "?" : gib(p.used_mib) + " GiB"}`),
+      el("code", {}, `pid ${p.pid}: ${p.cmdline || "—"}`));
+    d.open = openProcs.has(key);
+    d.addEventListener("toggle", () => { if (d.open) openProcs.add(key); else openProcs.delete(key); });
+    return d;
+  }));
+  if (g.status === "unknown" && g.error) c.procs.append(el("div", { class: "t-hot" }, g.error));
+  if (g.models && g.models.length) c.procs.prepend(el("div", { class: "models-on" },
+    g.models.map(m => `🧠 ${m.name} · :${m.port} · ${SRV_STATUS[m.status] || m.status}`).join("\n")));
+  renderActions(c, g);
+}
+
+function renderActions(c, g) {
+  const r = g.reservation, key = `${me}|${r ? r.user : ""}`;
+  if (c.act.dataset.key === key) return;  // кнопки не перемальовуються щосекунди, щоб не губити натискання
+  c.act.dataset.key = key;
+  const open = () => { c.purpose.value = r && r.user === me ? r.purpose : ""; fillTerms(c.term); c.form.classList.add("open"); c.purpose.focus(); };
+  const release = async (force) => {
+    if (force && !confirm(`Зняти бронювання ${r.user} з GPU ${g.index}?`)) return;
+    try { await post("/api/release", { gpu: g.index, user: me, force }); toast(`GPU ${g.index} вільна`); refresh(); refreshJournal(); }
+    catch (err) { toast(err.message); }
+  };
+  if (!me) c.act.replaceChildren();
+  else if (!r) c.act.replaceChildren(el("button", { class: "primary", onclick: open }, "Зайняти"));
+  else if (r.user === me) c.act.replaceChildren(el("button", { onclick: open }, "Змінити"), el("button", { onclick: () => release(false) }, "Звільнити"));
+  else c.act.replaceChildren(el("button", { class: "danger", onclick: () => release(true) }, "Зняти"));
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("/api/overview");
+    if (!r.ok) throw new Error();
+    const data = await r.json();
+    const sel = document.getElementById("me");
+    if (sel.options.length === 1) {
+      for (const u of data.users) sel.append(el("option", { value: u }, u));
+      sel.value = data.users.includes(me) ? me : "";
+      if (sel.value !== me) me = "";
+    }
+    if (LOOPBACK.has(location.hostname) && data.public_host) publicHost = data.public_host;
+    lastGpus = data.gpus;
+    data.gpus.forEach(render);
+    document.getElementById("free").textContent = `вільно ${data.gpus.filter(g => g.status === "free").length}/${data.gpus.length}`;
+    lastOk = Date.now();
+  } catch (e) { /* позначка зв'язку нижче скаже людині */ }
+  const stale = !lastOk || (Date.now() - lastOk) / 1000 > STALE_S;
+  const dot = document.getElementById("dot");
+  dot.className = stale ? "bad" : "ok";
+  dot.title = stale ? "немає зв'язку" : `оновлено ${new Date(lastOk).toLocaleTimeString("uk-UA")}`;
+}
+
+async function refreshJournal() {
+  try {
+    const r = await fetch("/api/journal?limit=30");
+    if (!r.ok) return;
+    const entries = await r.json();
+    document.getElementById("journal").replaceChildren(...(entries.length ? entries.map(e => el("li", {},
+      el("time", {}, when(e.ts)),
+      [`${e.user} ${ACTION[e.action] || e.action} ${e.repo ?? "GPU " + e.gpu}`, e.owner ? `(${e.owner})` : "", e.purpose, e.until ? `до ${when(e.until)}` : ""]
+        .filter(Boolean).join(" · "))) : [el("li", {}, "порожньо")]));
+  } catch (e) {}
+}
+
+// Інструкція підключення для кожної системи: [підпис, текст для копіювання] або [підпис] без блоку.
+const AGENT_KEY = "gpu_manager_agent";
+const AGENT_STEPS = {
+  claude: [
+    ["Підключити:"], ["", "claude mcp add --transport http --scope user gpu-manager http://{host}/mcp"],
+    ["Хто ви — рядок у ~/.claude/CLAUDE.md:"], ["", "gpu-manager: my user is {me}"],
+    ["Перевірка: claude mcp list або /mcp у сесії."]],
+  antigravity: [
+    ["Підключити — у ~/.gemini/config/mcp_config.json (Agent → MCP Servers → View raw config), злити з наявним:"],
+    ["", '{\n  "mcpServers": {\n    "gpu-manager": { "serverUrl": "http://{host}/mcp" }\n  }\n}'],
+    ["Хто ви — рядок у ~/.gemini/GEMINI.md:"], ["", "gpu-manager: my user is {me}"],
+    ["Перевірка: MCP Servers → gpu-manager увімкнений, видно інструменти gpu_*."]],
+  codex: [
+    ["Підключити:"], ["", "codex mcp add gpu-manager --url http://{host}/mcp"],
+    ["Або в ~/.codex/config.toml:"], ["", '[mcp_servers.gpu-manager]\nurl = "http://{host}/mcp"'],
+    ["Хто ви — рядок у ~/.codex/AGENTS.md:"], ["", "gpu-manager: my user is {me}"],
+    ["Перевірка: codex mcp list або /mcp у сесії."]],
+  opencode: [
+    ["Підключити — у ~/.config/opencode/opencode.json, злити з наявним:"],
+    ["", '{\n  "$schema": "https://opencode.ai/config.json",\n  "mcp": {\n    "gpu-manager": { "type": "remote", "url": "http://{host}/mcp", "enabled": true }\n  }\n}'],
+    ["Хто ви — рядок у ~/.config/opencode/AGENTS.md:"], ["", "gpu-manager: my user is {me}"],
+    ["Перевірка: opencode mcp list."]],
+};
+function fillHelp() {
+  const fill = (t) => t.replaceAll("{host}", publicHost).replaceAll("{me}", me || "<ваш логін>");
+  const kind = document.getElementById("agent-kind");
+  document.getElementById("agent-steps").replaceChildren(...(AGENT_STEPS[kind.value] || []).map(([label, code]) => {
+    if (code === undefined) return el("p", {}, label);
+    const b = el("button", { type: "button" }, "⧉");
+    const pre = el("pre", {}, fill(code));
+    b.addEventListener("click", () => copy(pre.textContent, b));
+    return el("div", { class: "cmd" }, pre, b);
+  }));
+  for (const pre of document.querySelectorAll("#mcp pre[data-t]")) pre.textContent = fill(pre.dataset.t);
+}
+async function copy(textValue, button) {
+  try { await navigator.clipboard.writeText(textValue); }
+  catch (e) {  // http без TLS: Clipboard API недоступний — старий спосіб через виділення
+    const ta = el("textarea", {}); ta.value = textValue; document.body.append(ta); ta.select();
+    try { document.execCommand("copy"); } finally { ta.remove(); }
+  }
+  button.textContent = "✓"; setTimeout(() => { button.textContent = "⧉"; }, 1500);
+}
+
+me = load("gpu_manager_user");
+document.getElementById("me").addEventListener("change", (e) => {
+  me = e.target.value; save("gpu_manager_user", me); cards.forEach(c => delete c.act.dataset.key); fillHelp(); refresh();
+});
+const mcpFold = document.getElementById("mcp");
+mcpFold.addEventListener("toggle", () => { if (mcpFold.open) fillHelp(); });
+const agentKind = document.getElementById("agent-kind");
+if (AGENT_STEPS[load(AGENT_KEY)]) agentKind.value = load(AGENT_KEY);
+agentKind.addEventListener("change", () => { save(AGENT_KEY, agentKind.value); fillHelp(); });
+for (const b of mcpFold.querySelectorAll(":scope > .cmd button")) b.addEventListener("click", () => copy(b.previousElementSibling.textContent, b));
+// ---- вкладка «Моделі» ---------------------------------------------------------------------------
+let tab = "gpus";
+function short(n) {
+  if (n === null || n === undefined) return "";
+  return n >= 1e9 ? (n / 1e9).toFixed(1) + "B" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(0) + "k" : String(n);
+}
+function showTab(name) {
+  tab = name;
+  sessionSet("gm_tab", name);
+  document.getElementById("tab-gpus").classList.toggle("on", name === "gpus");
+  document.getElementById("tab-models").classList.toggle("on", name === "models");
+  document.getElementById("tab-chat").classList.toggle("on", name === "chat");
+  document.getElementById("chat").classList.toggle("on", name === "chat");
+  if (name === "chat") refreshChatModels();
+  document.getElementById("gpus").style.display = name === "gpus" ? "" : "none";
+  document.getElementById("models").classList.toggle("on", name === "models");
+  if (name === "models") refreshModels();
+}
+function needMe() { if (!me) { toast("Спершу оберіть себе вгорі («Хто я?»)"); return false; } return true; }
+function fitLine(fit) {
+  const cards = Object.entries(fit.per_card).sort((a, b) => a[0] - b[0]);
+  const [, c] = cards[0];  // найменша карта — найсуворіша оцінка
+  const line = el("div", { class: "fit" });
+  line.append(c.fits
+    ? el("span", { class: "ok" }, `влізе · ${fit.weights_gib} GiB ваг · контекст до ${c.max_context_tokens === null ? "?" : short(c.max_context_tokens)}`)
+    : el("span", { class: "no" }, `не влізе в одну карту · ${fit.weights_gib} GiB ваг`));
+  for (const w of fit.warnings) line.append(el("small", { class: "warn" }, w));
+  return line;
+}
+async function openInfo(box, repo) {
+  if (box.dataset.open) { box.querySelector(".more")?.remove(); delete box.dataset.open; return; }
+  box.dataset.open = "1";
+  const more = el("div", { class: "more" }, el("small", {}, "рахую…"));
+  box.append(more);
+  try {
+    const r = await fetch(`/api/models/info?repo=${encodeURIComponent(repo)}`);
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    const btn = d.local ? el("small", {}, "уже на диску")
+      : el("button", { class: "primary", onclick: (e) => { e.stopPropagation(); download(repo); } }, `Завантажити ${d.size_gib} GiB`);
+    more.replaceChildren(fitLine(d.fit), el("div", { class: "act" }, btn));
+  } catch (err) { more.replaceChildren(el("small", { class: "t-hot" }, err.message)); }
+}
+async function search(e) {
+  e.preventDefault();
+  const q = document.getElementById("hf-q").value.trim();
+  const out = document.getElementById("hf-results");
+  if (!q) { out.replaceChildren(); return; }
+  sessionSet("gm_hf_q", q);
+  out.replaceChildren(el("small", {}, "шукаю…"));
+  try {
+    const r = await fetch(`/api/models/search?q=${encodeURIComponent(q)}&limit=10`);
+    const found = await r.json();
+    if (!r.ok) throw new Error(found.error || r.statusText);
+    out.replaceChildren(...(found.length ? found.map(m => {
+      const box = el("div", { class: "item" }, el("b", {}, m.repo),
+        el("small", {}, [m.params ? short(m.params) + " параметрів" : "", `${short(m.downloads)} завантажень`, m.gated ? "🔒 ліцензія" : ""].filter(Boolean).join(" · ")));
+      box.addEventListener("click", () => openInfo(box, m.repo));
+      return box;
+    }) : [el("small", {}, "нічого не знайдено")]));
+  } catch (err) { out.replaceChildren(el("small", { class: "t-hot" }, err.message)); }
+}
+async function download(repo) {
+  if (!needMe()) return;
+  try { await post("/api/models/download", { repo, user: me }); toast(`${repo}: у черзі`); refreshModels(); refreshJournal(); }
+  catch (err) { toast(err.message); }
+}
+async function cancelDl(repo) {
+  try { await post("/api/models/cancel", { repo, user: me }); refreshModels(); refreshJournal(); } catch (err) { toast(err.message); }
+}
+async function deleteModel(repo) {
+  if (!needMe() || !confirm(`Видалити ${repo} з диска?`)) return;
+  try { const r = await post("/api/models/delete", { repo, user: me }); toast(`Видалено, звільнено ${r.freed_gib} GiB`); refreshModels(); refreshJournal(); }
+  catch (err) { toast(err.message); }
+}
+// ---- один список моделей: завантажені, ті, що завантажуються, і запущені екземпляри під своєю моделлю -----------
+const SHOW_KEY = "gpu_manager_models_filter";
+function showFlags() { const v = load(SHOW_KEY); return { run: v !== "disk" && v !== "none", disk: v !== "run" && v !== "none" }; }
+// Вільна частка карти для повзунка (як на сервері: мінус 256 MiB запасу, донизу до відсотка).
+const MEM_SLACK_MIB = 256, MIN_FRACTION_PCT = 5;
+function freePct(g) {
+  if (!g) return 100;
+  return Math.max(MIN_FRACTION_PCT, Math.min(100, Math.floor(100 * (g.memory_total_mib - (g.memory_used_mib ?? 0) - MEM_SLACK_MIB) / g.memory_total_mib)));
+}
+function runForm(repo) {
+  const gpu = el("select", {}, ...lastGpus.map(g => el("option", { value: String(g.index) },
+    `GPU ${g.index} · ${gib(g.memory_total_mib - (g.memory_used_mib ?? 0))} GiB${g.reservation ? " 🔒" : ""}`)));
+  const free = lastGpus.find(g => g.status === "free");
+  if (free) gpu.value = String(free.index);
+  const slider = el("input", { type: "range", min: String(MIN_FRACTION_PCT), step: "1", "aria-label": "частка пам'яті карти" });
+  const label = el("small", { class: "pct" });
+  const card = () => lastGpus.find(g => g.index === Number(gpu.value));
+  const show = () => { const max = Number(slider.max), v = Number(slider.value);
+                       label.textContent = v >= max ? `${v}% макс` : `${v}%`;
+                       label.title = v >= max ? "уся вільна пам'ять карти; менеджер підбере сам" : "частка пам'яті карти"; };
+  const reset = () => { const max = freePct(card()); slider.max = String(max); slider.value = String(max); show(); };
+  gpu.addEventListener("change", reset);
+  slider.addEventListener("input", show);
+  reset();
+  const form = el("form", { class: "run new" }, el("span", { class: "cap" }, "Новий запуск:"), gpu,
+    el("div", { class: "slider" }, slider, label), el("button", { class: "primary", type: "submit" }, "Запустити"));
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    // Крайнє праве положення = «хай менеджер вибере сам» (драбина, профіль); інакше — явна частка.
+    const fraction = Number(slider.value) >= Number(slider.max) ? "" : (Number(slider.value) / 100).toFixed(2);
+    try { const r = await post("/api/servers/start", { repo, gpu: Number(gpu.value), user: me, fraction });
+          toast(`${r.name}: стартує на GPU ${r.gpu}, порт ${r.port}, частка ${r.fraction}`); refreshModels(); refreshJournal(); }
+    catch (err) { toast(err.message); }
+  });
+  return form;
+}
+async function stopServer(name) {
+  try { await post("/api/servers/stop", { name, user: me }); refreshModels(); refreshJournal(); } catch (err) { toast(err.message); }
+}
+// Відкриті логи: той самий <pre> переживає перемальовування списку; текст лише дописується, позиція прокрутки
+// зберігається (внизу — стежить за новими рядками, вище — лишається, де людина зупинилась).
+const LOG_LINES = 300;
+const logViews = new Map();
+async function refreshLog(name) {
+  const v = logViews.get(name);
+  if (!v) return;
+  try {
+    const r = await fetch(`/api/servers/logs?name=${encodeURIComponent(name)}&lines=${LOG_LINES}`);
+    const d = await r.json();
+    const text = r.ok ? d.lines.join("\n") || "порожньо" : d.error;
+    if (text === v.last) return;
+    v.last = text;
+    v.pre.textContent = text;
+    placeLog(v);
+  } catch (e) {}
+}
+// Прокрутку можна поставити лише елементу, що вже на сторінці: тому placeLog викликають після вставки списку.
+function placeLog(v) {
+  if (!v.pre.isConnected) return;
+  v.pre.scrollTop = v.atBottom ? v.pre.scrollHeight : v.top;
+  v.expect = v.pre.scrollTop;
+}
+function attachLog(box, name) {
+  box.append(logViews.get(name).pre);
+  refreshLog(name);
+}
+function toggleLog(box, name) {
+  if (logViews.has(name)) { logViews.get(name).pre.remove(); logViews.delete(name); return; }
+  const pre = el("pre", {}, "…");
+  const v = { pre, last: "", top: 0, atBottom: true, expect: -1 };
+  // Лише прокрутка людиною: не від'єднаний елемент і не значення, яке щойно поставив placeLog.
+  pre.addEventListener("scroll", () => {
+    if (!pre.isConnected || Math.abs(pre.scrollTop - v.expect) < 2) return;
+    v.top = pre.scrollTop; v.atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 8;
+  });
+  logViews.set(name, v);
+  attachLog(box, name);
+}
+// Незастосовані зміни карти/порту за назвою запущеної моделі: щосекундне оновлення їх не скидає.
+const pendingMove = new Map();
+let freePorts = [];
+async function applyMove(name) {
+  const p = pendingMove.get(name);
+  if (!p) return;
+  try { const r = await post("/api/servers/move", { name, user: me, gpu: p.gpu, port: p.port });
+        pendingMove.delete(name); toast(`${name}: перезапуск на GPU ${r.gpu}, порт ${r.port}`); refreshModels(); refreshJournal(); }
+  catch (err) { toast(err.message); }
+}
+function gpuLine(index) {
+  const g = lastGpus.find(x => x.index === index);
+  if (!g) return null;
+  const t = g.temperature_c;
+  return el("small", {}, el("span", { class: tempClass(t, g.temp_slowdown_c) }, t === null ? "—" : `${t}°`),
+    ` · ${g.util_pct ?? "—"}% · ${g.power_w === null ? "—" : Math.round(g.power_w) + " W"} · ${gib(g.memory_used_mib ?? 0)}/${gib(g.memory_total_mib)} GiB`);
+}
+function runLine(s) {
+  const u = s.usage || {};
+  const load = s.status === "running" && "running" in u
+    ? ` · запитів ${u.running ?? 0}, черга ${u.waiting ?? 0}, KV ${Math.round((u.kv_usage ?? 0) * 100)}%` : "";
+  const box = el("div", { class: "run-line" },
+    el("small", {}, `▶ ${SRV_STATUS[s.status] || s.status} · частка ${s.fraction}` +
+      `${s.max_model_len ? " · контекст " + short(s.max_model_len) : ""}${load}`),
+    gpuLine(s.gpu),
+    el("small", {}, `назва для агентів: ${s.name} · ${s.user}`),
+    s.auto_changes && s.auto_changes.length ? el("small", {}, `автовиправлення: ${s.auto_changes.join(", ")}`) : null,
+    s.hint ? el("small", { class: "t-hot" }, s.hint) : null);
+  if (me && s.status !== "failed") {
+    const want = pendingMove.get(s.name) || { gpu: s.gpu, port: s.port };
+    const gpu = el("select", {}, ...lastGpus.map(g => el("option", { value: String(g.index) }, `GPU ${g.index}`)));
+    gpu.value = String(want.gpu);
+    const port = el("select", {}, ...[...new Set([s.port, want.port, ...freePorts])].sort((a, b) => a - b)
+      .map(p => el("option", { value: String(p) }, `:${p}`)));
+    port.value = String(want.port);
+    const cancel = el("button", { type: "button", onclick: () => { pendingMove.delete(s.name); refreshModels(); } }, "Скасувати");
+    const change = el("button", { type: "button", class: "primary", onclick: () => applyMove(s.name) }, "Змінити");
+    // Кнопки неактивні, доки GPU чи порт не відрізняються від поточних.
+    const sync = () => { cancel.disabled = change.disabled = !pendingMove.has(s.name); };
+    const changed = () => {
+      const next = { gpu: Number(gpu.value), port: Number(port.value) };
+      if (next.gpu === s.gpu && next.port === s.port) pendingMove.delete(s.name); else pendingMove.set(s.name, next);
+      sync();
+    };
+    gpu.addEventListener("change", changed);
+    port.addEventListener("change", changed);
+    sync();
+    box.append(el("div", { class: "run" }, gpu, port, cancel, change));
+  }
+  box.append(el("div", { class: "act" }, el("button", { onclick: () => toggleLog(box, s.name) }, "Лог"),
+    me ? el("button", { class: "danger", onclick: () => stopServer(s.name) }, s.status === "failed" ? "Прибрати" : "Зупинити") : ""));
+  if (logViews.has(s.name)) attachLog(box, s.name);
+  return box;
+}
+async function refreshModels() {
+  const focused = document.activeElement;
+  if (focused && document.getElementById("local").contains(focused) && ["SELECT", "INPUT"].includes(focused.tagName)) return;
+  try {
+    const [rm, rs, rp] = await Promise.all([fetch("/api/models"), fetch("/api/servers"), fetch("/api/servers/ports")]);
+    if (!rm.ok || !rs.ok) return;
+    const d = await rm.json(), servers = await rs.json();
+    if (rp.ok) freePorts = await rp.json();
+    const flags = showFlags();
+    const byRepo = new Map();
+    const entry = (repo) => byRepo.get(repo) || byRepo.set(repo, { repo, local: null, dl: null, runs: [] }).get(repo);
+    d.local.forEach(m => { entry(m.repo).local = m; });
+    d.downloads.filter(x => x.status !== "done").forEach(x => { entry(x.repo).dl = x; });
+    servers.forEach(s => entry(s.repo).runs.push(s));
+    // «завантажені» — усе на диску чи в дорозі (запущені теж); «запущені» — з активним екземпляром.
+    const items = [...byRepo.values()].filter(e => (flags.disk && (e.local || e.dl)) || (flags.run && e.runs.length))
+      .sort((a, b) => (b.runs.length - a.runs.length) || a.repo.localeCompare(b.repo));
+    document.getElementById("local").replaceChildren(...(items.length ? items.map(e => {
+      const m = e.local, x = e.dl;
+      const active = x && (x.status === "queued" || x.status === "downloading");
+      // Незавершене завантаження називає, що сталося, і скільки вже є; готова модель — просто «на диску».
+      const broken = x && (x.status === "failed" || x.status === "cancelled");
+      const state = active ? `${DL_STATUS[x.status]} · ${x.done_gib}/${x.total_gib} GiB · ${x.percent}%`
+        : broken ? `${x.status === "failed" ? "помилка завантаження" : "скасовано"} · ${x.done_gib} GiB з ${x.total_gib}`
+        : m ? `${m.size_gib} GiB · на диску` : "";
+      return el("div", { class: "item" }, el("b", {}, e.repo), el("small", {}, state),
+        active ? el("div", { class: "bar", style: "margin-top:6px" }, el("i", { style: `width:${x.percent}%` })) : null,
+        x && x.error ? el("small", { class: "t-hot" }, x.error) : null,
+        ...e.runs.map(runLine),
+        me && m && m.state === "ready" ? runForm(e.repo) : null,
+        me ? el("div", { class: "act" },
+          active ? el("button", { onclick: () => cancelDl(e.repo) }, "Скасувати завантаження") : null,
+          broken ? el("button", { class: "primary", onclick: () => download(e.repo) }, "Продовжити завантаження") : null,
+          m && !active && !e.runs.some(s => s.status !== "failed") ? el("button", { class: "danger", onclick: () => deleteModel(e.repo) }, "Видалити з диска") : null) : null);
+    }) : [el("small", {}, "порожньо")]));
+    logViews.forEach(placeLog);  // список уже на сторінці — повернути прокрутку відкритих логів
+  } catch (e) {}
+}
+for (const [id, key] of [["f-run", "run"], ["f-disk", "disk"]]) {
+  const box = document.getElementById(id);
+  box.checked = showFlags()[key];
+  box.addEventListener("change", () => {
+    const run = document.getElementById("f-run").checked, disk = document.getElementById("f-disk").checked;
+    save(SHOW_KEY, run && !disk ? "run" : disk && !run ? "disk" : run && disk ? "all" : "none");
+    refreshModels();
+  });
+}
+// ---- чат з моделлю: історія лише в пам'яті сторінки; обмеження вирішує модель (vLLM), не сторінка ------------
+const chat = { model: "", messages: [], atts: [], ctrl: null };
+// Розширення, які читаються як текст і йдуть у репліку текстом (так їх приймає будь-яка модель).
+const TEXT_EXT = /\.(txt|md|csv|tsv|json|jsonl|log|py|js|ts|html|css|xml|yaml|yml|toml|ini|sh|c|h|cpp|java|go|rs|sql)$/i;
+async function refreshChatModels() {
+  try {
+    const r = await fetch("/api/servers");
+    const list = (await r.json()).filter(s => s.status === "running");
+    const sel = document.getElementById("chat-model");
+    const cur = sel.value;
+    sel.replaceChildren(...(list.length ? list.map(s => el("option", { value: s.name }, `${s.name} · GPU ${s.gpu}`))
+      : [el("option", { value: "" }, "немає запущених моделей")]));
+    const want = chat.model || cur;
+    if (list.some(s => s.name === want)) sel.value = want;
+  } catch (e) {}
+}
+function chatBubble(kind, text) {
+  const b = el("div", { class: `msg ${kind}` }, text);
+  document.getElementById("chat-log").append(b);
+  const log = document.getElementById("chat-log"); log.scrollTop = log.scrollHeight;
+  return b;
+}
+function readAs(file, how) {
+  return new Promise((ok, fail) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = fail;
+                                     how === "text" ? r.readAsText(file) : r.readAsDataURL(file); });
+}
+async function addAttachment(file) {
+  const isImage = file.type.startsWith("image/");
+  const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+  const isText = !isImage && !isPdf && (file.type.startsWith("text/") || TEXT_EXT.test(file.name));
+  const data = await readAs(file, isText ? "text" : "url");
+  chat.atts.push({ name: file.name || "картинка", kind: isImage ? "image" : isPdf ? "pdf" : isText ? "text" : "file", data, mode: "file" });
+  renderAtts();
+}
+function renderAtts() {
+  document.getElementById("chat-atts").replaceChildren(...chat.atts.map((a, i) => {
+    // PDF: вибір людини — віддати як є (вирішить модель), текстом чи картинками сторінок.
+    const mode = a.kind === "pdf" ? el("select", { "aria-label": "як надіслати PDF" },
+      ...[["file", "як є"], ["text", "текст"], ["images", "зображення"]].map(([v, t]) => el("option", { value: v }, t))) : null;
+    if (mode) { mode.value = a.mode; mode.addEventListener("change", () => { a.mode = mode.value; }); }
+    return el("span", {}, `${a.kind === "image" ? "🖼" : "📄"} ${a.name} `, mode,
+      el("button", { type: "button", onclick: () => { chat.atts.splice(i, 1); renderAtts(); } }, "×"));
+  }));
+}
+function saveChat() {
+  const log = document.getElementById("chat-log");
+  // Вміст журналу створено через textContent, тож його серіалізація безпечна для відновлення.
+  if (!sessionSet("gm_chat", JSON.stringify({ model: chat.model, messages: chat.messages, html: log.innerHTML })))
+    sessionSet("gm_chat", JSON.stringify({ model: chat.model, messages: chat.messages.map(stripImages), html: log.innerHTML.replace(/<img[^>]*>/g, "") }));
+}
+function stripImages(m) {  // запасний варіант, якщо картинки не влізли в сховище сесії
+  return Array.isArray(m.content) ? { ...m, content: m.content.filter(p => p.type !== "image_url") } : m;
+}
+function startChat() {
+  if (chat.ctrl) chat.ctrl.abort();
+  chat.model = document.getElementById("chat-model").value;
+  chat.messages = []; chat.atts = []; renderAtts();
+  document.getElementById("chat-log").replaceChildren();
+  sessionSet("gm_chat_draft", "");
+  saveChat();
+  if (!chat.model) toast("Немає запущених моделей: запустіть на вкладці «Моделі»");
+}
+async function sendChat() {
+  const box = document.getElementById("chat-text");
+  const text = box.value.trim();
+  if (!text && !chat.atts.length) return;
+  chat.model = chat.model || document.getElementById("chat-model").value;
+  if (!chat.model) { toast("Немає запущених моделей: запустіть на вкладці «Моделі»"); return; }
+  // Вміст у форматі OpenAI: текст; картинки — image_url; текстові файли — текстом; решта — file (вирішує модель).
+  const parts = [];
+  if (text) parts.push({ type: "text", text });
+  const bot0 = chat.atts.some(a => a.kind === "pdf" && a.mode !== "file") ? chatBubble("bot", "перетворюю PDF…") : null;
+  for (const a of chat.atts) {
+    if (a.kind === "pdf" && a.mode !== "file") {
+      try {
+        const conv = await post("/api/convert/pdf", { data: a.data, mode: a.mode });
+        if (a.mode === "text") parts.push({ type: "text", text: `[файл ${a.name}, ${conv.pages} стор.]\n${conv.text}` });
+        else conv.images.forEach(url => parts.push({ type: "image_url", image_url: { url } }));
+      } catch (err) { if (bot0) bot0.remove(); toast(`${a.name}: ${err.message}`); return; }
+      continue;
+    }
+    if (a.kind === "image") parts.push({ type: "image_url", image_url: { url: a.data } });
+    else if (a.kind === "text") parts.push({ type: "text", text: `[файл ${a.name}]\n${a.data}` });
+    else parts.push({ type: "file", file: { filename: a.name, file_data: a.data } });
+  }
+  if (bot0) bot0.remove();
+  const user = chatBubble("user", text);
+  for (const a of chat.atts) user.append(a.kind === "image" ? el("img", { src: a.data, alt: a.name })
+    : el("div", { class: "att" }, `📄 ${a.name}${a.kind === "pdf" ? " · " + { file: "як є", text: "текст", images: "зображення" }[a.mode] : ""}`));
+  chat.messages.push({ role: "user", content: parts.length === 1 && parts[0].type === "text" ? text : parts });
+  box.value = ""; sessionSet("gm_chat_draft", ""); chat.atts = []; renderAtts(); saveChat();
+  const bot = chatBubble("bot", "…");
+  chat.ctrl = new AbortController();
+  document.getElementById("chat-stop").hidden = false;
+  document.getElementById("chat-send").disabled = true;
+  let answer = "";
+  try {
+    const r = await fetch("/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: chat.model, messages: chat.messages, stream: true }), signal: chat.ctrl.signal });
+    if (!r.ok) {  // відмова моделі чи шлюзу — показуємо як є
+      const body = await r.text(); let msg = body;
+      try { const j = JSON.parse(body); msg = j.error?.message || j.message || body; } catch (e) {}
+      bot.className = "msg err"; bot.textContent = msg; chat.messages.pop(); return;
+    }
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split("\n"); buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith("data:") || line.includes("[DONE]")) continue;
+        try { const d = JSON.parse(line.slice(5)); answer += d.choices?.[0]?.delta?.content || ""; } catch (e) {}
+      }
+      bot.textContent = answer || "…";
+      const log = document.getElementById("chat-log");
+      if (log.scrollHeight - log.scrollTop - log.clientHeight < 80) log.scrollTop = log.scrollHeight;  // не смикати, якщо людина гортає вище
+    }
+    chat.messages.push({ role: "assistant", content: answer });
+  } catch (e) {
+    if (e.name === "AbortError") { bot.textContent = (answer || "") + " ⏹"; chat.messages.push({ role: "assistant", content: answer }); }
+    else { bot.className = "msg err"; bot.textContent = "Немає зв'язку з сервером"; chat.messages.pop(); }
+  } finally {
+    saveChat();
+    chat.ctrl = null;
+    document.getElementById("chat-stop").hidden = true;
+    document.getElementById("chat-send").disabled = false;
+  }
+}
+document.getElementById("tab-chat").addEventListener("click", () => showTab("chat"));
+document.getElementById("chat-start").addEventListener("click", startChat);
+document.getElementById("chat-send").addEventListener("click", sendChat);
+document.getElementById("chat-stop").addEventListener("click", () => { if (chat.ctrl) chat.ctrl.abort(); });
+document.getElementById("chat-attach").addEventListener("click", () => document.getElementById("chat-file").click());
+document.getElementById("chat-file").addEventListener("change", async (e) => { for (const f of e.target.files) await addAttachment(f); e.target.value = ""; });
+document.getElementById("chat-text").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendChat(); } });
+document.getElementById("chat-text").addEventListener("paste", async (e) => {
+  for (const item of e.clipboardData?.items || []) if (item.kind === "file") { e.preventDefault(); await addAttachment(item.getAsFile()); }
+});
+document.getElementById("chat-model").addEventListener("change", (e) => { chat.model = e.target.value; saveChat(); });
+document.getElementById("chat-text").addEventListener("input", (e) => sessionSet("gm_chat_draft", e.target.value));
+(function restoreSession() {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem("gm_chat") || "null");
+    if (saved) { chat.model = saved.model || ""; chat.messages = saved.messages || [];
+                 document.getElementById("chat-log").innerHTML = saved.html || ""; }
+    document.getElementById("chat-text").value = sessionStorage.getItem("gm_chat_draft") || "";
+    const q = sessionStorage.getItem("gm_hf_q");
+    if (q) { document.getElementById("hf-q").value = q; search(new Event("submit")); }
+    const t = sessionStorage.getItem("gm_tab");
+    if (t && t !== "gpus") showTab(t);
+  } catch (e) {}
+})();
+document.getElementById("tab-gpus").addEventListener("click", () => showTab("gpus"));
+document.getElementById("tab-models").addEventListener("click", () => showTab("models"));
+document.getElementById("hf-form").addEventListener("submit", search);
+setInterval(() => { if (!document.hidden && tab === "models") refreshModels(); }, MODELS_REFRESH_MS);
+fetch("/api/version").then(r => r.json()).then(b => {
+  document.getElementById("build").textContent = [`v${b.version}`,
+    b.commit ? `коміт ${b.commit}${b.dirty ? " +зміни" : ""}` : "комітів ще немає",
+    b.date ? new Date(b.date).toLocaleString("uk-UA", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" }) : ""]
+    .filter(Boolean).join(" · ");
+}).catch(() => {});
+refresh(); refreshJournal();
+setInterval(() => { if (!document.hidden) refresh(); }, 1000);
+setInterval(() => { if (!document.hidden) refreshJournal(); }, 10000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { refresh(); refreshJournal(); } });
+</script>
+</body>
+</html>
